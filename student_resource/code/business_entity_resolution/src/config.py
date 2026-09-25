@@ -23,33 +23,32 @@ MODEL_DIR = os.path.join(BASE_DIR, "code", "business_entity_resolution", "models
 
 # ─── pipeline parameters ─────────────────────────────────────────────────────
 # Blocking
-TFIDF_TOP_K = 30           # ↑ from 20 → higher blocking recall
+TFIDF_TOP_K = 20           # top-K candidates per query from TF-IDF blocking
 TFIDF_NGRAM_RANGE = (2, 4) # character n-gram range for TF-IDF
-TFIDF_MAX_FEATURES = 300_000  # ↑ from 200K → richer vocabulary
+TFIDF_MAX_FEATURES = 200_000
 
 # Training
 VAL_FRACTION = 0.1         # fraction of S1 entities to hold out for validation
 RANDOM_SEED = 42
-NEG_POS_RATIO = 5          # ↑ from 3 → more hard negatives for calibration
+NEG_POS_RATIO = 3          # negatives per positive in training pairs
 
 # XGBoost
 XGB_PARAMS = {
     "objective": "binary:logistic",
     "eval_metric": "logloss",
-    "max_depth": 10,            # ↑ from 8 → capture more feature interactions
-    "learning_rate": 0.05,      # ↓ from 0.1 → slower convergence, less overfit
+    "max_depth": 8,
+    "learning_rate": 0.1,
     "subsample": 0.8,
     "colsample_bytree": 0.8,
     "min_child_weight": 5,
     "gamma": 0.1,
     "reg_alpha": 0.1,
     "reg_lambda": 1.0,
-    "n_estimators": 800,        # ↑ from 500 → more trees for lower LR
-    "early_stopping_rounds": 50,  # ↑ from 30 → patience for lower LR
+    "n_estimators": 500,
+    "early_stopping_rounds": 30,
     "n_jobs": -1,
     "random_state": RANDOM_SEED,
     "tree_method": "hist",
-    "device": "cuda",           # GPU-accelerated training
 }
 
 # Threshold for final matching (optimized during validation)
