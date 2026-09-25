@@ -36,6 +36,7 @@ from xgboost import XGBClassifier
 from rapidfuzz import fuzz
 from rapidfuzz.distance import Levenshtein, JaroWinkler
 from tqdm import tqdm
+from difflib import SequenceMatcher
 
 warnings.filterwarnings("ignore")
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -54,7 +55,7 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "xgb_model.pkl")
 CACHE_DIR  = os.path.join(BASE_DIR, ".cache")       # parquet cache for preprocessed data
 
-TFIDF_TOP_K       = 30              # ↑ from 20 → better recall
+TFIDF_TOP_K       = 50              # ↑ from 30 → higher blocking recall
 TFIDF_MAX_FEATURES= 150_000         # OOM-safe: 300K × 8 threads = killed; 150K × 2 threads = ~600MB
 NEG_POS_RATIO     = 5               # ↑ from 3 → more hard negatives
 RANDOM_SEED       = 42
@@ -65,6 +66,8 @@ N_WORKERS         = min(mp.cpu_count(), 16)   # cap so we don't OOM
 BLOCK_THREADS     = 2               # CRITICAL: each thread = BATCH_SIZE×pool×4B RAM
                                     # 2 threads × 500 × 150K records × 4B ≈ 600MB safe
 PRED_BATCH_SIZE   = 100_000         # GPU predict batch to avoid OOM
+WORD_TFIDF_MAX    = 80_000          # word-level TF-IDF (lighter, complementary)
+WORD_TFIDF_TOP_K  = 20              # top-K for word-level pass
 
 # config print moved to main() to avoid worker spam
 
@@ -94,6 +97,12 @@ def _cache_load(path: str, suffix: str = "") -> pd.DataFrame | None:
     if os.path.exists(cp):
         t0 = time.time()
         df = pd.read_parquet(cp)
+        # Backward compat: ensure new columns exist from older caches
+        if "name_sorted_3tok" not in df.columns and "name_clean" in df.columns:
+            df["name_sorted_3tok"] = (df["name_clean"]
+                .str.split()
+                .apply(lambda xs: " ".join(sorted(xs)[:3])
+                       if isinstance(xs, list) and len(xs) >= 2 else ""))
         print(f"  [CACHE HIT] {os.path.basename(path)}{suffix} "
               f"({len(df):,} rows in {time.time()-t0:.1f}s)")
         return df
@@ -227,6 +236,11 @@ def fast_preprocess(df: pd.DataFrame) -> pd.DataFrame:
                            .str.findall(_RE_DIGITS)
                            .apply(lambda xs: " ".join(sorted(set(xs))[:5])
                                   if isinstance(xs, list) else ""))
+    # Sorted-token blocking key: sort name tokens, take first 3
+    df["name_sorted_3tok"] = (df["name_clean"]
+                              .str.split()
+                              .apply(lambda xs: " ".join(sorted(xs)[:3])
+                                     if isinstance(xs, list) and len(xs) >= 2 else ""))
     return df
 
 
@@ -295,6 +309,19 @@ def build_tfidf_blocker(pool_df: pd.DataFrame):
     )
     pool_mat = vec.fit_transform(pool_df["combined"].values)
     print(f"[Block] Matrix {pool_mat.shape} in {time.time()-t0:.1f}s")
+    return vec, pool_mat
+
+
+def build_word_tfidf_blocker(pool_df: pd.DataFrame):
+    """Word-level TF-IDF for complementary blocking pass."""
+    print("[Block] Fitting word-level TF-IDF...")
+    t0 = time.time()
+    vec = TfidfVectorizer(
+        analyzer="word", ngram_range=(1, 2),
+        max_features=WORD_TFIDF_MAX, sublinear_tf=True, dtype=np.float32,
+    )
+    pool_mat = vec.fit_transform(pool_df["combined"].values)
+    print(f"[Block] Word matrix {pool_mat.shape} in {time.time()-t0:.1f}s")
     return vec, pool_mat
 
 
@@ -400,8 +427,9 @@ def tfidf_block_batch(q_texts, q_countries, vec, pool_mat,
     return results
 
 
-def generate_all_candidates(s1_df, pool_df, vec, pool_mat, top_k=TFIDF_TOP_K):
-    """Multi-strategy blocking with TF-IDF + name-key + addr-num indexes."""
+def generate_all_candidates(s1_df, pool_df, vec, pool_mat, top_k=TFIDF_TOP_K,
+                            word_vec=None, word_pmat=None):
+    """Multi-strategy blocking: char TF-IDF + word TF-IDF + name-key + sorted-token-key + addr-num."""
     pool_ids       = pool_df["entity_id"].values
     pool_countries = pool_df["country_norm"].values
 
@@ -415,30 +443,36 @@ def generate_all_candidates(s1_df, pool_df, vec, pool_mat, top_k=TFIDF_TOP_K):
     _pk = _pk[_pk["nk"].str.len() >= 3]
     name_key_idx = _pk.groupby(["nk", "country_norm"])["entity_id"].apply(list).to_dict()
 
+    # Sorted-token key index (catches word reorderings)
+    _st = pool_df[["entity_id", "name_sorted_3tok", "country_norm"]].copy()
+    _st = _st[_st["name_sorted_3tok"].str.len() > 0]
+    sorted_tok_idx_raw = _st.groupby(["name_sorted_3tok", "country_norm"])["entity_id"].apply(list).to_dict()
+    sorted_tok_idx = {k: v[:100] for k, v in sorted_tok_idx_raw.items()}
+
     # Address-numbers index: group by (addr_nums_str, country_norm)
     _an = pool_df[["entity_id", "addr_nums_str", "country_norm"]].copy()
     _an = _an[_an["addr_nums_str"].str.len() > 0]
     addr_num_idx_raw = _an.groupby(["addr_nums_str", "country_norm"])["entity_id"].apply(list).to_dict()
-    # Cap lists at 100 to match original behaviour
     addr_num_idx = {k: v[:100] for k, v in addr_num_idx_raw.items()}
 
     print(f"[Block] Indexes built in {time.time()-t0:.1f}s "
-          f"(name_keys={len(name_key_idx):,}, addr_nums={len(addr_num_idx):,})")
+          f"(name_keys={len(name_key_idx):,}, sorted_tok={len(sorted_tok_idx):,}, "
+          f"addr_nums={len(addr_num_idx):,})")
 
     # ---- TF-IDF blocking in batches (threaded for batch-level parallelism) ----
-    s1_ids       = s1_df["entity_id"].values
-    s1_texts     = s1_df["combined"].values
-    s1_countries = s1_df["country_norm"].values
-    s1_names     = s1_df["name_clean"].values
-    s1_addr_nums = s1_df["addr_nums_str"].values
+    s1_ids         = s1_df["entity_id"].values
+    s1_texts       = s1_df["combined"].values
+    s1_countries   = s1_df["country_norm"].values
+    s1_names       = s1_df["name_clean"].values
+    s1_addr_nums   = s1_df["addr_nums_str"].values
+    s1_sorted_toks = s1_df["name_sorted_3tok"].values
 
     n = len(s1_df)
     candidates = {}
 
-    # Larger batches since the vectorised function handles OOM internally via chunking
-    eff_batch = min(BATCH_SIZE * 4, n)  # 4× larger batches → fewer Python round-trips
+    eff_batch = min(BATCH_SIZE * 4, n)
     batch_ranges = [(i, min(i + eff_batch, n)) for i in range(0, n, eff_batch)]
-    n_threads = min(4, len(batch_ranges))  # safe: vectorised C-level sparse ops release GIL
+    n_threads = min(4, len(batch_ranges))
     print(f"[Block] {len(batch_ranges)} batches, {n:,} queries, "
           f"using {n_threads} threads...")
 
@@ -450,7 +484,7 @@ def generate_all_candidates(s1_df, pool_df, vec, pool_mat, top_k=TFIDF_TOP_K):
         )
         return bs, be, cands
 
-    t0 = time.time()
+    t0_block = time.time()
     with ThreadPoolExecutor(max_workers=n_threads) as pool:
         futures = [pool.submit(_process_batch, rng) for rng in batch_ranges]
         for fut in tqdm(as_completed(futures), total=len(futures), desc="TF-IDF blocking"):
@@ -458,20 +492,50 @@ def generate_all_candidates(s1_df, pool_df, vec, pool_mat, top_k=TFIDF_TOP_K):
             for j, s1_idx in enumerate(range(bs, be)):
                 sid  = s1_ids[s1_idx]
                 cset = set(cands_batch[j])
-                # supplement: name key
+                co   = s1_countries[s1_idx]
+                # supplement: name prefix key
                 nm = s1_names[s1_idx]
-                co = s1_countries[s1_idx]
                 if len(nm) >= 3 and (nm[:5], co) in name_key_idx:
                     cset.update(name_key_idx[(nm[:5], co)][:50])
+                # supplement: sorted-token name key (catches word reorderings)
+                stk = s1_sorted_toks[s1_idx]
+                if stk and (stk, co) in sorted_tok_idx:
+                    cset.update(sorted_tok_idx[(stk, co)][:50])
                 # supplement: address numbers
                 an = s1_addr_nums[s1_idx]
                 if an and (an, co) in addr_num_idx:
                     cset.update(addr_num_idx[(an, co)][:50])
                 candidates[sid] = list(cset)
 
+    # ---- Word-level TF-IDF pass (complementary to char n-gram) ----
+    if word_vec is not None and word_pmat is not None:
+        print("[Block] Word-level TF-IDF pass...")
+        tw = time.time()
+        word_added = 0
+
+        def _process_word_batch(rng):
+            bs, be = rng
+            return bs, be, tfidf_block_batch(
+                s1_texts[bs:be], s1_countries[bs:be],
+                word_vec, word_pmat, pool_ids, pool_countries, WORD_TFIDF_TOP_K,
+            )
+
+        with ThreadPoolExecutor(max_workers=n_threads) as pool:
+            futures = [pool.submit(_process_word_batch, rng) for rng in batch_ranges]
+            for fut in tqdm(as_completed(futures), total=len(futures), desc="Word TF-IDF"):
+                bs, be, cands_batch = fut.result()
+                for j, s1_idx in enumerate(range(bs, be)):
+                    sid = s1_ids[s1_idx]
+                    before = len(candidates.get(sid, []))
+                    cset = set(candidates.get(sid, []))
+                    cset.update(cands_batch[j])
+                    candidates[sid] = list(cset)
+                    word_added += len(candidates[sid]) - before
+        print(f"[Block] Word TF-IDF added {word_added:,} new candidates in {time.time()-tw:.1f}s")
+
     total = sum(len(v) for v in candidates.values())
     avg   = total / max(len(candidates), 1)
-    print(f"[Block] {total:,} candidates ({avg:.1f}/entity) in {time.time()-t0:.1f}s")
+    print(f"[Block] {total:,} candidates ({avg:.1f}/entity) in {time.time()-t0_block:.1f}s")
     return candidates
 
 
@@ -495,17 +559,29 @@ def _lr(a, b):
     if la==0 and lb==0: return 1.0
     if la==0 or  lb==0: return 0.0
     return min(la,lb)/max(la,lb)
+def _char_ngrams(s, n=3):
+    """Character n-grams as a set."""
+    if not s or len(s) < n: return set()
+    return {s[i:i+n] for i in range(len(s)-n+1)}
+def _containment(s1, s2):
+    """Max substring containment ratio."""
+    if not s1 and not s2: return 1.0
+    if not s1 or not s2:  return 0.0
+    if s1 in s2: return len(s1) / len(s2)
+    if s2 in s1: return len(s2) / len(s1)
+    return 0.0
 
 
 def compute_pair_features(n1, a1, n2, a2):
-    """29 similarity features for one (S1, candidate) pair."""
+    """40 similarity features for one (S1, candidate) pair."""
     nt1, nt2 = _tokens(n1), _tokens(n2)
     at1, at2 = _tokens(a1), _tokens(a2)
     an1, an2 = _nums(a1),   _nums(a2)
     safe_n = (n1 and n2)
     safe_a = (a1 and a2)
+    c1, c2 = f"{n1} {a1}", f"{n2} {a2}"
     return [
-        # ---- name (13) ----
+        # ---- name (19) ----
         1.0 - Levenshtein.normalized_distance(n1, n2) if safe_n else (1.0 if not n1 and not n2 else 0.0),
         JaroWinkler.similarity(n1, n2)                if safe_n else (1.0 if not n1 and not n2 else 0.0),
         fuzz.token_sort_ratio(n1, n2) / 100.0,
@@ -519,7 +595,13 @@ def compute_pair_features(n1, a1, n2, a2):
         len(nt1 & nt2) / max(len(nt2), 1) if nt2 else 0.0,
         1.0 if (nt1 and nt2 and min(nt1) == min(nt2)) else 0.0,
         _lr(n1, n2),
-        # ---- address (9) ----
+        _containment(n1, n2),
+        _jac(_char_ngrams(n1, 3), _char_ngrams(n2, 3)),
+        SequenceMatcher(None, n1, n2).ratio() if safe_n else (1.0 if not n1 and not n2 else 0.0),
+        1.0 if (nt1 and nt2 and sorted(nt1)[0] == sorted(nt2)[0]) else 0.0,
+        min(len(nt1), len(nt2)) / max(len(nt1), len(nt2), 1),
+        1.0 if (safe_n and len(n1) >= 3 and len(n2) >= 3 and n1[:3] == n2[:3]) else 0.0,
+        # ---- address (11) ----
         1.0 - Levenshtein.normalized_distance(a1, a2) if safe_a else (1.0 if not a1 and not a2 else 0.0),
         JaroWinkler.similarity(a1, a2)                if safe_a else (1.0 if not a1 and not a2 else 0.0),
         fuzz.token_sort_ratio(a1, a2) / 100.0,
@@ -529,26 +611,34 @@ def compute_pair_features(n1, a1, n2, a2):
         _ovl(at1, at2),
         _dice(at1, at2),
         _lr(a1, a2),
-        # ---- address numbers (3) ----
+        _jac(at1 - an1, at2 - an2),
+        _containment(a1, a2),
+        # ---- address numbers (5) ----
         _jac(an1, an2),
         _ovl(an1, an2),
         len(an1 & an2) / max(len(an1), 1) if an1 else (1.0 if not an2 else 0.5),
-        # ---- cross (4) ----
-        fuzz.token_sort_ratio(f"{n1} {a1}", f"{n2} {a2}") / 100.0,
-        fuzz.token_set_ratio(f"{n1} {a1}", f"{n2} {a2}")  / 100.0,
+        1.0 if (an1 and an2 and sorted(an1)[0] == sorted(an2)[0]) else (1.0 if not an1 and not an2 else 0.0),
+        abs(len(an1) - len(an2)),
+        # ---- cross (5) ----
+        fuzz.token_sort_ratio(c1, c2) / 100.0,
+        fuzz.token_set_ratio(c1, c2)  / 100.0,
         _jac(nt1 | at1, nt2 | at2),
         abs(len(nt1) - len(nt2)),
+        1.0 - Levenshtein.normalized_distance(c1, c2) if (c1.strip() and c2.strip()) else (1.0 if not c1.strip() and not c2.strip() else 0.0),
     ]
 
-N_FEATURES = 29
+N_FEATURES = 40
 FEATURE_NAMES = [
     "name_lev","name_jw","name_tsort","name_tset","name_partial","name_ratio",
     "name_jac","name_ovl","name_dice","name_cont12","name_cont21",
     "name_first","name_lr",
+    "name_contain","name_char3_jac","name_lcs","name_first_sorted","name_tok_ratio",
+    "name_prefix3",
     "addr_lev","addr_jw","addr_tsort","addr_tset","addr_partial",
     "addr_jac","addr_ovl","addr_dice","addr_lr",
-    "anum_jac","anum_ovl","anum_match12",
-    "comb_tsort","comb_tset","comb_jac","name_tok_diff",
+    "addr_nonum_jac","addr_contain",
+    "anum_jac","anum_ovl","anum_match12","anum_first","anum_cnt_diff",
+    "comb_tsort","comb_tset","comb_jac","name_tok_diff","comb_lev",
 ]
 
 
@@ -679,22 +769,31 @@ def build_training_data(s1_df, pool_df, gt_df, candidates, neg_ratio=NEG_POS_RAT
 def train_xgb(X_train, y_train, X_val=None, y_val=None):
     n_neg = (y_train == 0).sum()
     n_pos = (y_train == 1).sum()
-    model = XGBClassifier(
+    params = dict(
         objective="binary:logistic", eval_metric="logloss",
-        max_depth=8, learning_rate=0.1, n_estimators=500,
+        max_depth=10, learning_rate=0.05, n_estimators=800,
         subsample=0.8, colsample_bytree=0.8,
-        min_child_weight=5, gamma=0.1, reg_alpha=0.1, reg_lambda=1.0,
+        min_child_weight=3, gamma=0.1, reg_alpha=0.1, reg_lambda=1.0,
         scale_pos_weight=n_neg / max(n_pos, 1),
-        device="cuda", tree_method="hist",    # GPU-accelerated training
+        tree_method="hist",
         n_jobs=-1, random_state=RANDOM_SEED,
-        early_stopping_rounds=30,
+        early_stopping_rounds=50,
     )
-    print(f"[XGB] Training on GPU (CUDA) with {X_train.shape[0]:,} samples...")
-    if X_val is not None:
-        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=50)
-    else:
-        model.fit(X_train, y_train, verbose=50)
-    return model
+    # Try GPU first, fall back to CPU
+    for device in ("cuda", "cpu"):
+        try:
+            model = XGBClassifier(**params, device=device)
+            print(f"[XGB] Training on {device.upper()} with {X_train.shape[0]:,} samples...")
+            if X_val is not None:
+                model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=50)
+            else:
+                model.fit(X_train, y_train, verbose=50)
+            return model
+        except Exception as e:
+            if device == "cuda":
+                print(f"[XGB] CUDA unavailable ({e}), falling back to CPU...")
+            else:
+                raise
 
 
 def find_best_threshold(model, X_val, y_val, beta=0.5):
@@ -944,8 +1043,9 @@ def run_train(sample_size):
 
     # ---- 6. Blocking ----
     vec, pmat = build_tfidf_blocker(pool)
-    tr_cands  = generate_all_candidates(s1_tr, pool, vec, pmat)
-    va_cands  = generate_all_candidates(s1_va, pool, vec, pmat)
+    word_vec, word_pmat = build_word_tfidf_blocker(pool)
+    tr_cands  = generate_all_candidates(s1_tr, pool, vec, pmat, word_vec=word_vec, word_pmat=word_pmat)
+    va_cands  = generate_all_candidates(s1_va, pool, vec, pmat, word_vec=word_vec, word_pmat=word_pmat)
 
     # Blocking recall
     gt_va_lk = {}
@@ -1038,7 +1138,8 @@ def _predict_test_by_country(model, threshold):
 
         # Block
         vec, pmat = build_tfidf_blocker(pool_co)
-        cands = generate_all_candidates(s1_co, pool_co, vec, pmat)
+        word_vec, word_pmat = build_word_tfidf_blocker(pool_co)
+        cands = generate_all_candidates(s1_co, pool_co, vec, pmat, word_vec=word_vec, word_pmat=word_pmat)
 
         # Predict
         matches = predict_all(model, s1_co, pool_co, cands, threshold)
