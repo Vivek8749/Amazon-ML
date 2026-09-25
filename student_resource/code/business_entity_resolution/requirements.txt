@@ -7,4 +7,4 @@ tqdm>=4.60.0
 scipy>=1.10.0
 pyarrow>=12.0.0
 # Optional: GPU-accelerated TF-IDF matmul (install cupy-cuda12x or cupy-cuda11x)
-cupy-cuda12x
+# cupy-cuda12x

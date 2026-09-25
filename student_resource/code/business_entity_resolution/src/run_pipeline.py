@@ -43,7 +43,7 @@ try:
     import cupy as cp
     import cupyx.scipy.sparse as csp
     _GPU_OK = cp.cuda.is_available()
-except ImportError:
+except Exception:
     _GPU_OK = False
 if _GPU_OK:
     print("[GPU] CuPy detected — TF-IDF matmul will run on GPU")
@@ -72,10 +72,10 @@ TFIDF_MAX_FEATURES= 200_000         # 200K vocab — plenty of RAM
 NEG_POS_RATIO     = 3               # balanced negatives
 RANDOM_SEED       = 42
 VAL_FRACTION      = 0.1
-BATCH_SIZE        = 4_000           # large batches for CPU throughput
+BATCH_SIZE        = 2_000           # smaller batches to cap peak RAM
 FEAT_CHUNK        = 25_000          # feature-computation chunk for workers
 N_WORKERS         = min(mp.cpu_count(), 16)   # use all 16 cores
-BLOCK_THREADS     = 4               # 4 concurrent blocking threads (64GB can handle it)
+BLOCK_THREADS     = 2               # 2 concurrent blocking threads to limit peak RAM
 PRED_BATCH_SIZE   = 500_000         # large CPU predict batch
 WORD_TFIDF_MAX    = 100_000         # bigger word vocab for better recall
 WORD_TFIDF_TOP_K  = 30              # word-level top-K
@@ -368,31 +368,35 @@ def _tfidf_query_chunk(args):
 
 
 def _matmul_topk(q_sub_mat, pool_sub_mat, pool_sub_ids, effective_k):
-    """Dense matmul + vectorised top-K on CPU.
-    With 64GB RAM we can safely materialise dense similarity matrices.
+    """Sparse matmul + per-row top-K — never materialises a dense matrix.
+    RAM-safe: only touches the non-zero entries of each result row.
     """
-    n_queries = q_sub_mat.shape[0]
-    n_pool    = pool_sub_mat.shape[0]
-
-    sim = q_sub_mat.dot(pool_sub_mat.T)
+    sim = q_sub_mat.dot(pool_sub_mat.T)          # sparse × sparse.T → sparse
     if hasattr(sim, 'toarray'):
-        sim_dense = sim.toarray().astype(np.float32)
+        # Ensure CSR format for efficient row slicing
+        if not isinstance(sim, csr_matrix):
+            sim = csr_matrix(sim)
     else:
-        sim_dense = np.asarray(sim, dtype=np.float32)
+        # Already dense (shouldn't happen, but handle gracefully)
+        sim = csr_matrix(sim)
 
-    if effective_k >= n_pool:
-        results = []
-        for i in range(n_queries):
-            nz = np.nonzero(sim_dense[i])[0]
-            results.append(pool_sub_ids[nz].tolist())
-        return results
-
-    top_k_idx = np.argpartition(sim_dense, -effective_k, axis=1)[:, -effective_k:]
     results = []
-    for i in range(n_queries):
-        row_top = top_k_idx[i]
-        valid = row_top[sim_dense[i, row_top] > 0]
-        results.append(pool_sub_ids[valid].tolist())
+    for i in range(sim.shape[0]):
+        row = sim.getrow(i)
+        if row.nnz == 0:
+            results.append([])
+            continue
+        idx = row.indices
+        dat = row.data
+        if len(dat) <= effective_k:
+            # Fewer non-zeros than top-K: return all with score > 0
+            valid = idx[dat > 0]
+            results.append(pool_sub_ids[valid].tolist())
+        else:
+            # argpartition on the small non-zero array (not the full pool)
+            top = np.argpartition(dat, -effective_k)[-effective_k:]
+            valid = top[dat[top] > 0]
+            results.append(pool_sub_ids[idx[valid]].tolist())
     return results
 
 
@@ -407,7 +411,7 @@ def tfidf_block_batch(q_texts, q_countries, vec, pool_mat,
     for i in range(n_queries):
         country_groups[q_countries[i]].append(i)
 
-    CHUNK = 2_000   # 2K queries per chunk — fast with 64GB RAM
+    CHUNK = 500   # 500 queries per chunk — keeps RAM low (sparse matmul)
     for country, q_indices in country_groups.items():
         pool_mask = pool_countries == country
         if not pool_mask.any():
@@ -554,6 +558,7 @@ def generate_all_candidates(s1_df, pool_df, vec, pool_mat, top_k=TFIDF_TOP_K,
     total = sum(len(v) for v in candidates.values())
     avg   = total / max(len(candidates), 1)
     print(f"[Block] {total:,} candidates ({avg:.1f}/entity) in {time.time()-t0_block:.1f}s")
+    gc.collect()   # free TF-IDF intermediates before feature engineering
     return candidates
 
 
@@ -1022,7 +1027,7 @@ def run_train(sample_size):
                          size=min(sample_size, len(s1_full)), replace=False)
         s1s = s1_full[s1_full["entity_id"].isin(set(ids))].copy()
         gts = gt_full[gt_full["source1_entity_id"].isin(set(ids))].copy()
-        extra = 50_000  # 50K extra/country — 64GB RAM handles it
+        extra = 30_000  # 30K extra/country — keeps pool manageable
         # Pool size = must_haves + 30K × n_countries ≈ 100-150K records max
         # At 150K pool: 2 threads × 500 queries × 150K × 4B = ~600MB ✔
     countries = set(s1s["country_norm"].unique())
