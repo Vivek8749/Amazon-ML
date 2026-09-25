@@ -1,0 +1,39 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+.env
+.venv
+env/
+venv/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+__MACOSX/
+
+# Project specific: Datasets and Large Data Files (Ignore all data so GitHub stays lightweight)
+dataset/
+**/dataset/
+*.csv
+*.tsv
+*.parquet
+*.jsonl
+*.gz
+*.zip
+*.tar
+*.tar.gz
+
+# Project specific: Model checkpoints and artifacts
+**/models/*.pkl
+**/models/*.bin
+*.pkl
+*.model
+
+# Project specific: Output / logs
+output/
+**/output/
+*.log
