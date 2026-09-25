@@ -67,18 +67,18 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "xgb_model.pkl")
 CACHE_DIR  = os.path.join(BASE_DIR, ".cache")       # parquet cache for preprocessed data
 
-TFIDF_TOP_K       = 50              # ↑ from 30 → higher blocking recall
-TFIDF_MAX_FEATURES= 100_000         # 100K→ ~1.2GB on GPU (float32 CSR); was 150K
-NEG_POS_RATIO     = 5               # ↑ from 3 → more hard negatives
+TFIDF_TOP_K       = 100             # high blocking recall
+TFIDF_MAX_FEATURES= 200_000         # 200K vocab — plenty of RAM
+NEG_POS_RATIO     = 3               # balanced negatives
 RANDOM_SEED       = 42
 VAL_FRACTION      = 0.1
-BATCH_SIZE        = 2_000           # larger batches → fewer GPU kernel launches
+BATCH_SIZE        = 4_000           # large batches for CPU throughput
 FEAT_CHUNK        = 25_000          # feature-computation chunk for workers
-N_WORKERS         = min(mp.cpu_count(), 8)    # ↓ 16→8: saves ~4 GB from fork copies
-BLOCK_THREADS     = 1               # GPU matmul is already parallel; 1 thread enough
-PRED_BATCH_SIZE   = 200_000         # GPU predict batch
-WORD_TFIDF_MAX    = 60_000          # word-level TF-IDF — smaller vocab, less RAM
-WORD_TFIDF_TOP_K  = 20              # top-K for word-level pass
+N_WORKERS         = min(mp.cpu_count(), 16)   # use all 16 cores
+BLOCK_THREADS     = 4               # 4 concurrent blocking threads (64GB can handle it)
+PRED_BATCH_SIZE   = 500_000         # large CPU predict batch
+WORD_TFIDF_MAX    = 100_000         # bigger word vocab for better recall
+WORD_TFIDF_TOP_K  = 30              # word-level top-K
 
 # config print moved to main() to avoid worker spam
 
@@ -368,62 +368,38 @@ def _tfidf_query_chunk(args):
 
 
 def _matmul_topk(q_sub_mat, pool_sub_mat, pool_sub_ids, effective_k):
-    """GPU-accelerated (CuPy) sparse × dense matmul with top-K extraction.
-    Falls back to NumPy if CuPy is unavailable or the transfer would OOM.
-    Returns list-of-lists of matching pool IDs.
+    """Dense matmul + vectorised top-K on CPU.
+    With 64GB RAM we can safely materialise dense similarity matrices.
     """
     n_queries = q_sub_mat.shape[0]
     n_pool    = pool_sub_mat.shape[0]
 
-    if _GPU_OK:
-        try:
-            # Transfer sparse matrices to GPU as CSR float32
-            q_gpu    = csp.csr_matrix(q_sub_mat.astype(np.float32))
-            pool_gpu = csp.csr_matrix(pool_sub_mat.astype(np.float32))
-            # Sparse × sparse → sparse, then todense for top-K
-            sim_gpu  = (q_gpu.dot(pool_gpu.T)).toarray()   # (n_q, n_pool)
-            sim_np   = cp.asnumpy(sim_gpu)
-            del q_gpu, pool_gpu, sim_gpu
-            cp.get_default_memory_pool().free_all_blocks()
-        except Exception:
-            # GPU OOM or any error — fall back silently
-            sim_np = q_sub_mat.dot(pool_sub_mat.T)
-            if hasattr(sim_np, "toarray"):
-                sim_np = sim_np.toarray()
-            else:
-                sim_np = np.asarray(sim_np, dtype=np.float32)
+    sim = q_sub_mat.dot(pool_sub_mat.T)
+    if hasattr(sim, 'toarray'):
+        sim_dense = sim.toarray().astype(np.float32)
     else:
-        sim_np = q_sub_mat.dot(pool_sub_mat.T)
-        if hasattr(sim_np, "toarray"):
-            sim_np = sim_np.toarray().astype(np.float32)
-        else:
-            sim_np = np.asarray(sim_np, dtype=np.float32)
+        sim_dense = np.asarray(sim, dtype=np.float32)
 
     if effective_k >= n_pool:
         results = []
         for i in range(n_queries):
-            nz = np.nonzero(sim_np[i])[0]
+            nz = np.nonzero(sim_dense[i])[0]
             results.append(pool_sub_ids[nz].tolist())
         return results
 
-    top_k_idx = np.argpartition(sim_np, -effective_k, axis=1)[:, -effective_k:]
+    top_k_idx = np.argpartition(sim_dense, -effective_k, axis=1)[:, -effective_k:]
     results = []
     for i in range(n_queries):
         row_top = top_k_idx[i]
-        valid   = row_top[sim_np[i, row_top] > 0]
+        valid = row_top[sim_dense[i, row_top] > 0]
         results.append(pool_sub_ids[valid].tolist())
     return results
 
 
 def tfidf_block_batch(q_texts, q_countries, vec, pool_mat,
                       pool_ids, pool_countries, top_k=TFIDF_TOP_K):
-    """TF-IDF blocking — GPU-accelerated per-country bulk matmul + top-K.
-
-    Groups queries by country, slices the pool to same-country rows, then
-    calls _matmul_topk() which tries CuPy GPU first and falls back to CPU.
-    Typical speedup over CPU: 5-20× depending on pool size and GPU bandwidth.
-    """
-    q_mat = vec.transform(q_texts)   # scipy CSR on CPU
+    """TF-IDF blocking — bulk matmul + vectorised top-K per country."""
+    q_mat = vec.transform(q_texts)
     n_queries = q_mat.shape[0]
     results = [None] * n_queries
 
@@ -431,7 +407,7 @@ def tfidf_block_batch(q_texts, q_countries, vec, pool_mat,
     for i in range(n_queries):
         country_groups[q_countries[i]].append(i)
 
-    CHUNK = 4_000   # larger chunks → fewer GPU kernel launches
+    CHUNK = 2_000   # 2K queries per chunk — fast with 64GB RAM
     for country, q_indices in country_groups.items():
         pool_mask = pool_countries == country
         if not pool_mask.any():
@@ -476,21 +452,27 @@ def generate_all_candidates(s1_df, pool_df, vec, pool_mat, top_k=TFIDF_TOP_K,
     _pk = _pk[_pk["nk"].str.len() >= 3]
     name_key_idx = _pk.groupby(["nk", "country_norm"])["entity_id"].apply(list).to_dict()
 
+    # Name prefix-4 index (shorter prefix catches more fuzzy matches)
+    _p4 = pool_df[["entity_id", "name_clean", "country_norm"]].copy()
+    _p4["nk4"] = _p4["name_clean"].str[:4]
+    _p4 = _p4[_p4["nk4"].str.len() >= 3]
+    name_key4_idx = _p4.groupby(["nk4", "country_norm"])["entity_id"].apply(list).to_dict()
+
     # Sorted-token key index (catches word reorderings)
     _st = pool_df[["entity_id", "name_sorted_3tok", "country_norm"]].copy()
     _st = _st[_st["name_sorted_3tok"].str.len() > 0]
     sorted_tok_idx_raw = _st.groupby(["name_sorted_3tok", "country_norm"])["entity_id"].apply(list).to_dict()
-    sorted_tok_idx = {k: v[:100] for k, v in sorted_tok_idx_raw.items()}
+    sorted_tok_idx = {k: v[:200] for k, v in sorted_tok_idx_raw.items()}
 
     # Address-numbers index: group by (addr_nums_str, country_norm)
     _an = pool_df[["entity_id", "addr_nums_str", "country_norm"]].copy()
     _an = _an[_an["addr_nums_str"].str.len() > 0]
     addr_num_idx_raw = _an.groupby(["addr_nums_str", "country_norm"])["entity_id"].apply(list).to_dict()
-    addr_num_idx = {k: v[:100] for k, v in addr_num_idx_raw.items()}
+    addr_num_idx = {k: v[:200] for k, v in addr_num_idx_raw.items()}
 
     print(f"[Block] Indexes built in {time.time()-t0:.1f}s "
-          f"(name_keys={len(name_key_idx):,}, sorted_tok={len(sorted_tok_idx):,}, "
-          f"addr_nums={len(addr_num_idx):,})")
+          f"(name_keys5={len(name_key_idx):,}, name_keys4={len(name_key4_idx):,}, "
+          f"sorted_tok={len(sorted_tok_idx):,}, addr_nums={len(addr_num_idx):,})")
 
     # ---- TF-IDF blocking in batches (threaded for batch-level parallelism) ----
     s1_ids         = s1_df["entity_id"].values
@@ -503,9 +485,9 @@ def generate_all_candidates(s1_df, pool_df, vec, pool_mat, top_k=TFIDF_TOP_K,
     n = len(s1_df)
     candidates = {}
 
-    eff_batch = min(BATCH_SIZE * 4, n)
+    eff_batch = min(BATCH_SIZE, n)
     batch_ranges = [(i, min(i + eff_batch, n)) for i in range(0, n, eff_batch)]
-    n_threads = min(4, len(batch_ranges))
+    n_threads = min(BLOCK_THREADS, len(batch_ranges))
     print(f"[Block] {len(batch_ranges)} batches, {n:,} queries, "
           f"using {n_threads} threads...")
 
@@ -526,18 +508,21 @@ def generate_all_candidates(s1_df, pool_df, vec, pool_mat, top_k=TFIDF_TOP_K,
                 sid  = s1_ids[s1_idx]
                 cset = set(cands_batch[j])
                 co   = s1_countries[s1_idx]
-                # supplement: name prefix key
+                # supplement: name prefix-5 key
                 nm = s1_names[s1_idx]
                 if len(nm) >= 3 and (nm[:5], co) in name_key_idx:
-                    cset.update(name_key_idx[(nm[:5], co)][:50])
+                    cset.update(name_key_idx[(nm[:5], co)][:100])
+                # supplement: name prefix-4 key (broader)
+                if len(nm) >= 3 and (nm[:4], co) in name_key4_idx:
+                    cset.update(name_key4_idx[(nm[:4], co)][:100])
                 # supplement: sorted-token name key (catches word reorderings)
                 stk = s1_sorted_toks[s1_idx]
                 if stk and (stk, co) in sorted_tok_idx:
-                    cset.update(sorted_tok_idx[(stk, co)][:50])
+                    cset.update(sorted_tok_idx[(stk, co)][:100])
                 # supplement: address numbers
                 an = s1_addr_nums[s1_idx]
                 if an and (an, co) in addr_num_idx:
-                    cset.update(addr_num_idx[(an, co)][:50])
+                    cset.update(addr_num_idx[(an, co)][:100])
                 candidates[sid] = list(cset)
 
     # ---- Word-level TF-IDF pass (complementary to char n-gram) ----
@@ -802,34 +787,23 @@ def build_training_data(s1_df, pool_df, gt_df, candidates, neg_ratio=NEG_POS_RAT
 def train_xgb(X_train, y_train, X_val=None, y_val=None):
     n_neg = (y_train == 0).sum()
     n_pos = (y_train == 1).sum()
-    # Use GPU hist for XGBoost — much faster with 16GB VRAM
-    # max_bin=512 packs more histogram resolution into VRAM
     params = dict(
         objective="binary:logistic", eval_metric="logloss",
         max_depth=10, learning_rate=0.05, n_estimators=800,
         subsample=0.8, colsample_bytree=0.8,
         min_child_weight=3, gamma=0.1, reg_alpha=0.1, reg_lambda=1.0,
         scale_pos_weight=n_neg / max(n_pos, 1),
-        tree_method="hist",   # device=cuda triggers gpu_hist automatically
-        max_bin=512,          # higher resolution histograms on GPU
-        n_jobs=-1, random_state=RANDOM_SEED,
+        tree_method="hist",
+        n_jobs=16, random_state=RANDOM_SEED,
         early_stopping_rounds=50,
     )
-    # Try GPU first, fall back to CPU
-    for device in ("cuda", "cpu"):
-        try:
-            model = XGBClassifier(**params, device=device)
-            print(f"[XGB] Training on {device.upper()} with {X_train.shape[0]:,} samples...")
-            if X_val is not None:
-                model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=50)
-            else:
-                model.fit(X_train, y_train, verbose=50)
-            return model
-        except Exception as e:
-            if device == "cuda":
-                print(f"[XGB] CUDA unavailable ({e}), falling back to CPU...")
-            else:
-                raise
+    model = XGBClassifier(**params, device="cpu")
+    print(f"[XGB] Training on CPU (16 cores) with {X_train.shape[0]:,} samples...")
+    if X_val is not None:
+        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=50)
+    else:
+        model.fit(X_train, y_train, verbose=50)
+    return model
 
 
 def find_best_threshold(model, X_val, y_val, beta=0.5):
@@ -1048,7 +1022,7 @@ def run_train(sample_size):
                          size=min(sample_size, len(s1_full)), replace=False)
         s1s = s1_full[s1_full["entity_id"].isin(set(ids))].copy()
         gts = gt_full[gt_full["source1_entity_id"].isin(set(ids))].copy()
-        extra = min(max(sample_size * 3, 20_000), 30_000)  # cap at 30K/country to avoid OOM
+        extra = 50_000  # 50K extra/country — 64GB RAM handles it
         # Pool size = must_haves + 30K × n_countries ≈ 100-150K records max
         # At 150K pool: 2 threads × 500 queries × 150K × 4B = ~600MB ✔
     countries = set(s1s["country_norm"].unique())
