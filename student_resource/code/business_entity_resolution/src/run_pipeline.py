@@ -14,6 +14,7 @@ Usage:
     python run_pipeline.py --mode predict
 """
 import argparse
+import hashlib
 import os
 import sys
 import time
@@ -51,6 +52,7 @@ TEST_S2  = os.path.join(BASE_DIR, "dataset", "test", "test_source2.tsv")
 TEST_S3  = os.path.join(BASE_DIR, "dataset", "test", "test_source3.tsv")
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "xgb_model.pkl")
+CACHE_DIR  = os.path.join(BASE_DIR, ".cache")       # parquet cache for preprocessed data
 
 TFIDF_TOP_K       = 30              # ↑ from 20 → better recall
 TFIDF_MAX_FEATURES= 150_000         # OOM-safe: 300K × 8 threads = killed; 150K × 2 threads = ~600MB
@@ -66,10 +68,121 @@ PRED_BATCH_SIZE   = 100_000         # GPU predict batch to avoid OOM
 
 # config print moved to main() to avoid worker spam
 
+# ===== DYNAMIC PARQUET CACHE ==================================================
+# Key idea: preprocessing regex is the bottleneck (~800s for large files).
+# After first run, save preprocessed DataFrames as .parquet files keyed on
+# (filename, file_size, mtime). Subsequent runs load parquet in ~10-15s.
+
+def _file_fingerprint(path: str) -> str:
+    """Fast fingerprint: basename + size + mtime. No content hashing needed
+    because the source TSVs never change between runs."""
+    st = os.stat(path)
+    raw = f"{os.path.basename(path)}:{st.st_size}:{int(st.st_mtime)}"
+    return hashlib.md5(raw.encode()).hexdigest()[:12]
+
+
+def _cache_path(path: str, suffix: str = "") -> str:
+    """Return the parquet cache file path for a given source TSV."""
+    fp = _file_fingerprint(path)
+    tag = os.path.splitext(os.path.basename(path))[0]
+    return os.path.join(CACHE_DIR, f"{tag}_{fp}{suffix}.parquet")
+
+
+def _cache_load(path: str, suffix: str = "") -> pd.DataFrame | None:
+    """Try loading preprocessed data from parquet cache. Returns None on miss."""
+    cp = _cache_path(path, suffix)
+    if os.path.exists(cp):
+        t0 = time.time()
+        df = pd.read_parquet(cp)
+        print(f"  [CACHE HIT] {os.path.basename(path)}{suffix} "
+              f"({len(df):,} rows in {time.time()-t0:.1f}s)")
+        return df
+    return None
+
+
+def _cache_save(path: str, df: pd.DataFrame, suffix: str = "") -> None:
+    """Save preprocessed DataFrame to parquet cache."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cp = _cache_path(path, suffix)
+    try:
+        df.to_parquet(cp, engine="pyarrow", compression="snappy", index=False)
+        sz_mb = os.path.getsize(cp) / (1024 * 1024)
+        print(f"  [CACHE SAVE] {os.path.basename(cp)} ({sz_mb:.1f} MB)")
+    except Exception as e:
+        print(f"  [CACHE WARN] Could not save cache: {e}")
+
+
+def _cache_clear():
+    """Remove all cached parquet files."""
+    if os.path.isdir(CACHE_DIR):
+        import shutil
+        shutil.rmtree(CACHE_DIR)
+        print("[Cache] Cleared all cached data.")
+
+# ===== PRE-COMPILED MEGA-REGEX (compiled ONCE at import time) =================
+# Instead of 40+ separate .str.replace() calls (each re-iterating the Series),
+# we compile 4 mega-patterns and do 4 single-pass substitutions.
+
+# --- Name: dotted legal abbreviations (order: longest first) ---
+_NAME_DOTTED_MAP = {
+    "s.a.r.l.": "sarl", "s.a.r.l": "sarl",
+    "s.a.s.": "sas",   "s.a.s": "sas",
+    "s.c.i.": "sci",   "s.c.i": "sci",
+    "l.l.c.": "llc",   "l.l.c": "llc",
+    "l.l.p.": "llp",   "l.l.p": "llp",
+    "p.l.c.": "plc",   "p.l.c": "plc",
+    "l.p.": "lp",      "l.p": "lp",
+    "n.a.": "na",      "n.a": "na",
+}
+_RE_NAME_DOTTED = re.compile(
+    "|".join(re.escape(k) for k in sorted(_NAME_DOTTED_MAP, key=len, reverse=True))
+)
+def _repl_name_dotted(m): return _NAME_DOTTED_MAP[m.group()]
+
+# --- Name: full words + trailing-dot suffixes (single pass) ---
+_NAME_WORD_MAP = {
+    "incorporated": "inc", "corporation": "corp", "limited": "ltd",
+    "company": "co", "private": "pvt",
+    "inc.": "inc", "corp.": "corp", "ltd.": "ltd", "pvt.": "pvt",
+}
+_RE_NAME_WORDS = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in sorted(_NAME_WORD_MAP, key=len, reverse=True)) + r")\b"
+)
+def _repl_name_words(m): return _NAME_WORD_MAP[m.group()]
+
+# --- Address: full words + trailing-dot abbreviations (single pass) ---
+_ADDR_MAP = {
+    # Full words
+    "street": "st", "road": "rd", "avenue": "ave", "boulevard": "blvd",
+    "drive": "dr", "lane": "ln", "highway": "hwy", "parkway": "pkwy",
+    "terrace": "ter", "apartment": "apt", "suite": "ste", "building": "bldg",
+    "floor": "fl", "district": "dist", "nagar": "ngr", "sector": "sec",
+    "colony": "col",
+    # Trailing-dot abbreviations
+    "st.": "st", "rd.": "rd", "ave.": "ave", "blvd.": "blvd",
+    "dr.": "dr", "apt.": "apt", "ste.": "ste", "bldg.": "bldg",
+    "fl.": "fl", "no.": "no",
+}
+_RE_ADDR = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in sorted(_ADDR_MAP, key=len, reverse=True)) + r")\b"
+)
+def _repl_addr(m): return _ADDR_MAP[m.group()]
+
+# Common patterns compiled once
+_RE_BRACKETS  = re.compile(r"[\[\](){}]")
+_RE_DOMAIN    = re.compile(r"\.(com|org|net|in|fr|co\.in)$")
+_RE_CO_DOT    = re.compile(r"\bco\.(?=\s|$)")
+_RE_MULTI_WS  = re.compile(r"\s+")
+_RE_DIGITS    = re.compile(r"\d+")
+
+
 # ===== FAST VECTORISED PREPROCESSING ==========================================
 
 def fast_preprocess(df: pd.DataFrame) -> pd.DataFrame:
     """Vectorised string cleaning with entity-resolution normalisation.
+
+    Uses pre-compiled mega-regex patterns for single-pass substitutions
+    instead of 40+ chained .str.replace() calls.
 
     Applies:
       1. Basic cleaning (lowercase, bracket removal, &/+ expansion)
@@ -80,95 +193,60 @@ def fast_preprocess(df: pd.DataFrame) -> pd.DataFrame:
     """
     df = df.copy()
 
-    # --- Name cleaning ---
+    # --- Name cleaning (4 passes instead of 22) ---
     name = (df["business_name"]
             .fillna("")
             .str.lower()
-            .str.replace(r"[\[\]\(\)\{\}]", " ", regex=True)
+            .str.replace(_RE_BRACKETS, " ", regex=True)
             .str.replace("&", " and ", regex=False)
             .str.replace("+", " and ", regex=False))
-    # Dotted legal abbreviations (order matters: longer patterns first)
-    name = (name
-            .str.replace(r"s\.a\.r\.l\.?", "sarl", regex=True)
-            .str.replace(r"s\.a\.s\.?",   "sas",  regex=True)
-            .str.replace(r"s\.c\.i\.?",   "sci",  regex=True)
-            .str.replace(r"l\.l\.c\.?",   "llc",  regex=True)
-            .str.replace(r"l\.l\.p\.?",   "llp",  regex=True)
-            .str.replace(r"p\.l\.c\.?",   "plc",  regex=True)
-            .str.replace(r"l\.p\.?",       "lp",   regex=True)
-            .str.replace(r"n\.a\.?",       "na",   regex=True))
-    # Full-word legal suffixes
-    name = (name
-            .str.replace(r"\bincorporated\b", "inc",  regex=True)
-            .str.replace(r"\bcorporation\b",  "corp", regex=True)
-            .str.replace(r"\blimited\b",      "ltd",  regex=True)
-            .str.replace(r"\bcompany\b",      "co",   regex=True)
-            .str.replace(r"\bprivate\b",      "pvt",  regex=True))
-    # Trailing-dot abbreviated suffixes (Inc. → inc, Corp. → corp, etc.)
-    name = (name
-            .str.replace(r"\binc\.",  "inc",  regex=True)
-            .str.replace(r"\bcorp\.", "corp", regex=True)
-            .str.replace(r"\bltd\.",  "ltd",  regex=True)
-            .str.replace(r"\bpvt\.",  "pvt",  regex=True)
-            .str.replace(r"\bco\.(?=\s|$)",  "co",   regex=True))
-    # Remove .com/.org/.net/.in/.fr domain suffixes from names
-    name = name.str.replace(r"\.(com|org|net|in|fr|co\.in)$", "", regex=True)
-    df["name_clean"] = name.str.replace(r"\s+", " ", regex=True).str.strip()
+    # Pass 1: dotted abbreviations (s.a.r.l. → sarl, l.l.c. → llc, etc.)
+    name = name.str.replace(_RE_NAME_DOTTED, _repl_name_dotted, regex=True)
+    # Pass 2: full-word + trailing-dot suffixes (corporation → corp, inc. → inc)
+    name = name.str.replace(_RE_NAME_WORDS, _repl_name_words, regex=True)
+    # Pass 3: domain suffixes, co. edge case
+    name = name.str.replace(_RE_DOMAIN, "", regex=True)
+    name = name.str.replace(_RE_CO_DOT, "co", regex=True)
+    df["name_clean"] = name.str.replace(_RE_MULTI_WS, " ", regex=True).str.strip()
 
-    # --- Address cleaning ---
+    # --- Address cleaning (2 passes instead of 27) ---
     addr = (df["business_address"]
             .fillna("")
             .str.lower()
-            .str.replace(r"[\[\]\(\)\{\}]", " ", regex=True)
+            .str.replace(_RE_BRACKETS, " ", regex=True)
             .str.replace("&", " and ", regex=False)
             .str.replace("+", " and ", regex=False))
-    # Address word-level abbreviation normalisation
-    addr = (addr
-            .str.replace(r"\bstreet\b",    "st",   regex=True)
-            .str.replace(r"\broad\b",      "rd",   regex=True)
-            .str.replace(r"\bavenue\b",    "ave",  regex=True)
-            .str.replace(r"\bboulevard\b", "blvd", regex=True)
-            .str.replace(r"\bdrive\b",     "dr",   regex=True)
-            .str.replace(r"\blane\b",      "ln",   regex=True)
-            .str.replace(r"\bhighway\b",   "hwy",  regex=True)
-            .str.replace(r"\bparkway\b",   "pkwy", regex=True)
-            .str.replace(r"\bterrace\b",   "ter",  regex=True)
-            .str.replace(r"\bapartment\b", "apt",  regex=True)
-            .str.replace(r"\bsuite\b",     "ste",  regex=True)
-            .str.replace(r"\bbuilding\b",  "bldg", regex=True)
-            .str.replace(r"\bfloor\b",     "fl",   regex=True)
-            .str.replace(r"\bdistrict\b",  "dist", regex=True)
-            .str.replace(r"\bnagar\b",     "ngr",  regex=True)
-            .str.replace(r"\bsector\b",    "sec",  regex=True)
-            .str.replace(r"\bcolony\b",    "col",  regex=True))
-    # Trailing-dot address abbreviations
-    addr = (addr
-            .str.replace(r"\bst\.",   "st",   regex=True)
-            .str.replace(r"\brd\.",   "rd",   regex=True)
-            .str.replace(r"\bave\.",  "ave",  regex=True)
-            .str.replace(r"\bblvd\.", "blvd", regex=True)
-            .str.replace(r"\bdr\.",   "dr",   regex=True)
-            .str.replace(r"\bapt\.",  "apt",  regex=True)
-            .str.replace(r"\bste\.",  "ste",  regex=True)
-            .str.replace(r"\bbldg\.", "bldg", regex=True)
-            .str.replace(r"\bfl\.",   "fl",   regex=True)
-            .str.replace(r"\bno\.",   "no",   regex=True))
-    df["addr_clean"] = addr.str.replace(r"\s+", " ", regex=True).str.strip()
+    # Single pass: full words + trailing-dot abbreviations
+    addr = addr.str.replace(_RE_ADDR, _repl_addr, regex=True)
+    df["addr_clean"] = addr.str.replace(_RE_MULTI_WS, " ", regex=True).str.strip()
 
     df["country_norm"] = df["country"].fillna("").str.lower().str.strip()
     df["combined"]     = df["name_clean"] + " " + df["addr_clean"]
-    # Numeric tokens from address (for blocking key)
+    # Numeric tokens from address (for blocking key) — vectorised extraction
     df["addr_nums_str"] = (df["addr_clean"]
-                           .str.findall(r"\d+")
+                           .str.findall(_RE_DIGITS)
                            .apply(lambda xs: " ".join(sorted(set(xs))[:5])
                                   if isinstance(xs, list) else ""))
     return df
 
 
-def _load_one_source(path: str) -> pd.DataFrame:
-    """Load + preprocess one TSV with progress bar for large files."""
+def _load_one_source(path: str, use_cache: bool = True) -> pd.DataFrame:
+    """Load + preprocess one TSV, with parquet disk caching.
+
+    First call: reads TSV → preprocesses → saves .parquet cache.
+    Subsequent calls: loads .parquet directly (~10-20x faster).
+    """
     tag = os.path.basename(path)
     t0 = time.time()
+
+    # --- Try cache first ---
+    if use_cache:
+        cached = _cache_load(path)
+        if cached is not None:
+            return cached
+
+    # --- Cache miss: load from TSV + preprocess ---
+    print(f"  [CACHE MISS] {tag} — loading from TSV...")
     fsize = os.path.getsize(path) if os.path.exists(path) else 0
     if fsize > 20 * 1024 * 1024:
         chunks = []
@@ -181,16 +259,23 @@ def _load_one_source(path: str) -> pd.DataFrame:
         df = fast_preprocess(df)
     dt = time.time() - t0
     print(f"  [{tag}] {len(df):,} rows in {dt:.1f}s")
+
+    # --- Save to cache for next run ---
+    if use_cache:
+        _cache_save(path, df)
+
     return df
 
 
-def load_sources_parallel(*paths) -> list:
-    """Load multiple source files in parallel using threads (I/O-bound)."""
+def load_sources_parallel(*paths, use_cache: bool = True) -> list:
+    """Load multiple source files in parallel using threads (I/O-bound).
+    Each file is individually cached as parquet."""
     print(f"[IO] Loading {len(paths)} files in parallel threads...")
     t0 = time.time()
     results = [None] * len(paths)
     with ThreadPoolExecutor(max_workers=len(paths)) as pool:
-        futures = {pool.submit(_load_one_source, p): i for i, p in enumerate(paths)}
+        futures = {pool.submit(_load_one_source, p, use_cache): i
+                   for i, p in enumerate(paths)}
         for fut in as_completed(futures):
             idx = futures[fut]
             results[idx] = fut.result()
@@ -685,7 +770,9 @@ def _load_pool_sampled(s2_path, s3_path, must_have_ids, countries,
     Load a manageable subset of S2+S3 that includes:
       1) ALL records whose entity_id is in must_have_ids (ground-truth matches)
       2) A random sample of extra_per_country per country (noise / negatives)
-    Uses chunked reading so we never hold all 5M rows at once.
+
+    Leverages parquet cache: loads full preprocessed source files from cache
+    (fast), then samples in-memory instead of re-preprocessing from TSV.
     """
     print(f"[Pool] Loading sampled pool (must_have={len(must_have_ids):,}, "
           f"extra/country={extra_per_country:,})...")
@@ -694,12 +781,40 @@ def _load_pool_sampled(s2_path, s3_path, must_have_ids, countries,
     frames_must = []
     frames_rand = {c: [] for c in countries}
     rand_counts = {c: 0 for c in countries}
+    rng_pool = np.random.RandomState(seed)
 
     for path in (s2_path, s3_path):
         tag = os.path.basename(path)
+
+        # --- Try loading full preprocessed file from cache ---
+        cached = _cache_load(path)
+        if cached is not None:
+            # Fast path: sample from cached full DataFrame
+            mask_must = cached["entity_id"].isin(must)
+            if mask_must.any():
+                frames_must.append(cached[mask_must])
+            rest = cached[~mask_must]
+            for co in countries:
+                if rand_counts[co] >= extra_per_country:
+                    continue
+                co_rows = rest[rest["country_norm"] == co]
+                need = extra_per_country - rand_counts[co]
+                if len(co_rows) > need:
+                    co_rows = co_rows.sample(n=need, random_state=rng_pool)
+                if len(co_rows) > 0:
+                    frames_rand[co].append(co_rows)
+                    rand_counts[co] += len(co_rows)
+            del cached, rest; gc.collect()
+            print(f"  [{tag}] sampled from cache")
+            continue
+
+        # --- Cache miss: chunked reading + preprocess + build cache ---
+        print(f"  [CACHE MISS] {tag} — scanning chunks from TSV...")
+        all_chunks = []  # collect all preprocessed chunks for caching
         for chunk in tqdm(pd.read_csv(path, sep="\t", dtype=str, chunksize=200_000),
                           desc=f"Scanning {tag}", unit="chunk"):
             chunk = fast_preprocess(chunk)
+            all_chunks.append(chunk)
             # Must-have rows
             mask_must = chunk["entity_id"].isin(must)
             if mask_must.any():
@@ -712,11 +827,16 @@ def _load_pool_sampled(s2_path, s3_path, must_have_ids, countries,
                 co_rows = rest[rest["country_norm"] == co]
                 need = extra_per_country - rand_counts[co]
                 if len(co_rows) > need:
-                    co_rows = co_rows.sample(n=need, random_state=seed)
+                    co_rows = co_rows.sample(n=need, random_state=rng_pool)
                 if len(co_rows) > 0:
                     frames_rand[co].append(co_rows)
                     rand_counts[co] += len(co_rows)
-        print(f"  [{tag}] scanned")
+
+        # Save full preprocessed file to cache for next run
+        full_df = pd.concat(all_chunks, ignore_index=True)
+        _cache_save(path, full_df)
+        del all_chunks, full_df; gc.collect()
+        print(f"  [{tag}] scanned + cached")
 
     all_frames = frames_must
     for co in countries:
@@ -829,17 +949,31 @@ def run_train(sample_size):
 def _predict_test_by_country(model, threshold):
     """
     Predict on the test set country-by-country to manage memory.
-    For each country: load relevant pool subset, block, predict, collect results.
+    For each country: filter cached pool subset, block, predict, collect results.
+
+    OPTIMIZATION: Test S2/S3 are preprocessed ONCE (and cached), then filtered
+    per country in-memory. Previously we re-read + re-preprocessed the full
+    TSVs for EACH country (3× redundant I/O + regex work).
     """
     print("\n" + "="*72)
     print(" TEST PREDICTION (country-by-country)")
     print("="*72)
     t0 = time.time()
 
-    # Load S1 test (smallest file)
+    # Load S1 test (smallest file, cached)
     ts1 = _load_one_source(TEST_S1)
     countries = sorted(ts1["country_norm"].unique())
     print(f"[Test] S1: {len(ts1):,} entities, countries: {countries}")
+
+    # Preprocess full test S2 + S3 ONCE (cached on disk after first run)
+    print("[Test] Loading full test pool (preprocessed + cached)...")
+    t_pool = time.time()
+    pool_parts = []
+    for path in (TEST_S2, TEST_S3):
+        pool_parts.append(_load_one_source(path, use_cache=True))
+    test_pool_full = pd.concat(pool_parts, ignore_index=True)
+    del pool_parts; gc.collect()
+    print(f"[Test] Full pool: {len(test_pool_full):,} records in {time.time()-t_pool:.1f}s")
 
     all_matches = {}
     all_candidates = {}
@@ -850,20 +984,8 @@ def _predict_test_by_country(model, threshold):
         s1_co = ts1[ts1["country_norm"] == country].copy()
         print(f"[Test/{country}] S1 entities: {len(s1_co):,}")
 
-        # Load pool for this country only (chunked)
-        pool_frames = []
-        for path in (TEST_S2, TEST_S3):
-            tag = os.path.basename(path)
-            for chunk in tqdm(pd.read_csv(path, sep="\t", dtype=str, chunksize=300_000),
-                              desc=f"Scanning {tag} ({country})", unit="chunk"):
-                chunk = fast_preprocess(chunk)
-                co_chunk = chunk[chunk["country_norm"] == country]
-                if len(co_chunk) > 0:
-                    pool_frames.append(co_chunk)
-            print(f"  [{tag}] scanned for {country}")
-
-        pool_co = pd.concat(pool_frames, ignore_index=True) if pool_frames else pd.DataFrame()
-        del pool_frames; gc.collect()
+        # Filter pool for this country (fast: in-memory boolean mask)
+        pool_co = test_pool_full[test_pool_full["country_norm"] == country].copy()
         print(f"[Test/{country}] Pool: {len(pool_co):,}")
 
         if len(pool_co) == 0:
@@ -887,6 +1009,8 @@ def _predict_test_by_country(model, threshold):
         del pool_co, vec, pmat, cands, matches; gc.collect()
         print(f"[Test/{country}] Done in {time.time()-tc:.0f}s")
 
+    del test_pool_full; gc.collect()
+
     # Write
     write_output(all_matches, all_candidates, OUTPUT_DIR)
     print(f"\n[Test] TOTAL TIME: {time.time()-t0:.0f}s")
@@ -907,19 +1031,21 @@ def run_predict():
 
 
 def main():
-    print(f"[Config] Workers: {N_WORKERS}, CPUs: {mp.cpu_count()}")
+    print(f"[Config] Workers: {N_WORKERS}, CPUs: {mp.cpu_count()}, "
+          f"Cache: {CACHE_DIR}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["train","full","predict"], default="train")
     parser.add_argument("--sample-size", type=int, default=20000)
+    parser.add_argument("--clear-cache", action="store_true",
+                        help="Delete all cached .parquet files before running")
     args = parser.parse_args()
+    if args.clear_cache:
+        _cache_clear()
     {"train": lambda: run_train(args.sample_size),
      "full":  lambda: run_full(args.sample_size),
      "predict": run_predict}[args.mode]()
 
 
-if __name__ == "__main__":
-    mp.freeze_support()       # needed on Windows
-    main()
 if __name__ == "__main__":
     mp.freeze_support()       # needed on Windows
     main()
