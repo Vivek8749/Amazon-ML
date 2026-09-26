@@ -61,6 +61,17 @@ if _LSH_OK:
 else:
     print("[LSH] Not available (pip install datasketch) — skipping MinHash/LSH")
 
+# ---- Phonetic codes (jellyfish) -----------------------------------------------
+try:
+    import jellyfish
+    _PHONETIC_OK = True
+except ImportError:
+    _PHONETIC_OK = False
+if _PHONETIC_OK:
+    print("[Phonetic] jellyfish available")
+else:
+    print("[Phonetic] Not available (pip install jellyfish) — phonetic features disabled")
+
 # ---- GPU (CuPy) with graceful CPU fallback -----------------------------------
 try:
     import cupy as cp
@@ -119,6 +130,15 @@ LSH_NGRAM_SIZE    = 3               # character n-gram size for MinHash shinglin
 # ---- Pre-filter configuration ----
 PREFILTER_MAX_CANDIDATES = 200      # max candidates per entity after pre-filter
 PREFILTER_MIN_SCORE      = 0.15     # minimum quick-score to keep a candidate
+
+# ---- Hard negative mining ----
+HARD_NEG_SCORE_FLOOR = 0.3          # only mine false positives scored above this
+HARD_NEG_MIX_RATIO   = 0.6          # 60% hard negatives, 40% random in round 2
+HARD_NEG_MAX_RATIO   = 5            # never more than 5:1 neg-to-pos after mining
+
+# ---- Singleton detection ----
+SINGLETON_MAX_SCORE_THRESHOLD = 0.4 # if best candidate score < this, mark as singleton
+SINGLETON_MARGIN_THRESHOLD    = 0.15 # if gap between best and 2nd-best is < this, cautious
 
 # config print moved to main() to avoid worker spam
 
@@ -991,15 +1011,84 @@ def _containment(s1, s2):
     return 0.0
 
 
+# ---- Phonetic helpers --------------------------------------------------------
+
+def _soundex(s):
+    """Compute Soundex code for the first meaningful word."""
+    if not _PHONETIC_OK or not s:
+        return ""
+    # Take first alphabetic token
+    words = re.findall(r'[a-zA-Z]+', s)
+    if not words:
+        return ""
+    try:
+        return jellyfish.soundex(words[0])
+    except Exception:
+        return ""
+
+def _metaphone(s):
+    """Compute Metaphone code for the first meaningful word."""
+    if not _PHONETIC_OK or not s:
+        return ""
+    words = re.findall(r'[a-zA-Z]+', s)
+    if not words:
+        return ""
+    try:
+        return jellyfish.metaphone(words[0])
+    except Exception:
+        return ""
+
+def _nysiis(s):
+    """Compute NYSIIS code for the first meaningful word."""
+    if not _PHONETIC_OK or not s:
+        return ""
+    words = re.findall(r'[a-zA-Z]+', s)
+    if not words:
+        return ""
+    try:
+        return jellyfish.nysiis(words[0])
+    except Exception:
+        return ""
+
+def _soundex_all_tokens(s):
+    """Soundex codes for all alphabetic tokens as a set."""
+    if not _PHONETIC_OK or not s:
+        return set()
+    words = re.findall(r'[a-zA-Z]{2,}', s)
+    codes = set()
+    for w in words:
+        try:
+            codes.add(jellyfish.soundex(w))
+        except Exception:
+            pass
+    return codes
+
+def _extract_pin_codes(addr):
+    """Extract PIN/ZIP codes: 5-6 digit numbers from address."""
+    if not addr:
+        return set()
+    return set(re.findall(r'\b\d{5,6}\b', addr))
+
+def _extract_city_tokens(addr):
+    """Extract likely city tokens (alphabetic tokens of length >= 3, not common abbreviations)."""
+    if not addr:
+        return set()
+    _skip = {'st', 'rd', 'ave', 'blvd', 'dr', 'ln', 'ct', 'pl', 'hwy', 'apt',
+             'ste', 'bldg', 'fl', 'no', 'ngr', 'dist', 'sec', 'blk', 'col',
+             'and', 'near', 'opp', 'behind', 'next', 'the', 'of', 'in', 'at'}
+    tokens = re.findall(r'[a-zA-Z]{3,}', addr.lower())
+    return {t for t in tokens if t not in _skip}
+
+
 def compute_pair_features(n1, a1, n2, a2):
-    """40 similarity features for one (S1, candidate) pair."""
+    """48 similarity features for one (S1, candidate) pair."""
     nt1, nt2 = _tokens(n1), _tokens(n2)
     at1, at2 = _tokens(a1), _tokens(a2)
     an1, an2 = _nums(a1),   _nums(a2)
     safe_n = (n1 and n2)
     safe_a = (a1 and a2)
     c1, c2 = f"{n1} {a1}", f"{n2} {a2}"
-    return [
+    feats = [
         # ---- name (19) ----
         1.0 - Levenshtein.normalized_distance(n1, n2) if safe_n else (1.0 if not n1 and not n2 else 0.0),
         JaroWinkler.similarity(n1, n2)                if safe_n else (1.0 if not n1 and not n2 else 0.0),
@@ -1046,7 +1135,36 @@ def compute_pair_features(n1, a1, n2, a2):
         1.0 - Levenshtein.normalized_distance(c1, c2) if (c1.strip() and c2.strip()) else (1.0 if not c1.strip() and not c2.strip() else 0.0),
     ]
 
-N_FEATURES = 40
+    # ---- phonetic features (8) ----
+    sx1, sx2 = _soundex(n1), _soundex(n2)
+    mp1, mp2 = _metaphone(n1), _metaphone(n2)
+    ny1, ny2 = _nysiis(n1), _nysiis(n2)
+    sxa1, sxa2 = _soundex_all_tokens(n1), _soundex_all_tokens(n2)
+    pin1, pin2 = _extract_pin_codes(a1), _extract_pin_codes(a2)
+    city1, city2 = _extract_city_tokens(a1), _extract_city_tokens(a2)
+
+    feats.extend([
+        # Soundex exact match on first word
+        1.0 if (sx1 and sx2 and sx1 == sx2) else 0.0,
+        # Metaphone exact match on first word
+        1.0 if (mp1 and mp2 and mp1 == mp2) else 0.0,
+        # Soundex Jaro-Winkler (phonetic fuzzy match)
+        JaroWinkler.similarity(sx1, sx2) if (sx1 and sx2) else 0.0,
+        # NYSIIS match on first word
+        1.0 if (ny1 and ny2 and ny1 == ny2) else 0.0,
+        # Soundex Jaccard across all name tokens
+        _jac(sxa1, sxa2),
+        # PIN/ZIP code exact match
+        1.0 if (pin1 and pin2 and pin1 & pin2) else (1.0 if not pin1 and not pin2 else 0.0),
+        # City token overlap
+        _ovl(city1, city2),
+        # Address numeric token count match (same number of numbers = structural similarity)
+        1.0 if len(an1) == len(an2) else 1.0 / (1.0 + abs(len(an1) - len(an2))),
+    ])
+
+    return feats
+
+N_FEATURES = 48
 FEATURE_NAMES = [
     "name_lev","name_jw","name_tsort","name_tset","name_partial","name_ratio",
     "name_jac","name_ovl","name_dice","name_cont12","name_cont21",
@@ -1058,6 +1176,10 @@ FEATURE_NAMES = [
     "addr_nonum_jac","addr_contain",
     "anum_jac","anum_ovl","anum_match12","anum_first","anum_cnt_diff",
     "comb_tsort","comb_tset","comb_jac","name_tok_diff","comb_lev",
+    # phonetic (8)
+    "phon_soundex_match","phon_metaphone_match","phon_soundex_jw",
+    "phon_nysiis_match","phon_soundex_jac",
+    "addr_pin_match","addr_city_ovl","addr_num_cnt_match",
 ]
 
 
@@ -1185,26 +1307,85 @@ def build_training_data(s1_df, pool_df, gt_df, candidates, neg_ratio=NEG_POS_RAT
 
 # ===== MODEL ===================================================================
 
-def train_xgb(X_train, y_train, X_val=None, y_val=None):
+# XGBoost hyperparameter grid for tuning
+XGB_GRID = [
+    {"max_depth": 8,  "learning_rate": 0.05, "n_estimators": 800},
+    {"max_depth": 10, "learning_rate": 0.05, "n_estimators": 800},
+    {"max_depth": 10, "learning_rate": 0.03, "n_estimators": 1200},
+    {"max_depth": 12, "learning_rate": 0.05, "n_estimators": 600},
+    {"max_depth": 8,  "learning_rate": 0.1,  "n_estimators": 500},
+    {"max_depth": 10, "learning_rate": 0.1,  "n_estimators": 500},
+]
+
+
+def train_xgb(X_train, y_train, X_val=None, y_val=None, grid_search=True):
+    """Train XGBoost with optional grid search over depth/lr/n_estimators.
+
+    If grid_search=True and X_val is provided, trains all configs in XGB_GRID,
+    picks the one with the best validation F₀.₅. Otherwise uses the first config.
+    """
     n_neg = (y_train == 0).sum()
     n_pos = (y_train == 1).sum()
-    params = dict(
+    spw = n_neg / max(n_pos, 1)
+
+    base_params = dict(
         objective="binary:logistic", eval_metric="logloss",
-        max_depth=10, learning_rate=0.05, n_estimators=800,
         subsample=0.8, colsample_bytree=0.8,
         min_child_weight=3, gamma=0.1, reg_alpha=0.1, reg_lambda=1.0,
-        scale_pos_weight=n_neg / max(n_pos, 1),
+        scale_pos_weight=spw,
         tree_method="hist",
-        n_jobs=16, random_state=RANDOM_SEED,
+        n_jobs=N_WORKERS, random_state=RANDOM_SEED,
         early_stopping_rounds=50,
     )
-    model = XGBClassifier(**params, device="cpu")
-    print(f"[XGB] Training on CPU (16 cores) with {X_train.shape[0]:,} samples...")
-    if X_val is not None:
-        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=50)
-    else:
-        model.fit(X_train, y_train, verbose=50)
-    return model
+
+    if not grid_search or X_val is None:
+        # Single config: use first grid entry
+        cfg = XGB_GRID[0]
+        params = {**base_params, **cfg}
+        model = XGBClassifier(**params, device="cpu")
+        print(f"[XGB] Training single config: {cfg}")
+        model.fit(X_train, y_train, eval_set=[(X_val, y_val)] if X_val is not None else None, verbose=50)
+        return model
+
+    # Grid search
+    print(f"[XGB] Grid search: {len(XGB_GRID)} configurations")
+    best_model = None
+    best_f05 = -1.0
+    best_cfg = None
+    results = []
+
+    for i, cfg in enumerate(XGB_GRID):
+        params = {**base_params, **cfg}
+        model = XGBClassifier(**params, device="cpu")
+        print(f"\n[XGB Grid {i+1}/{len(XGB_GRID)}] {cfg}")
+        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=0)
+
+        # Evaluate with F₀.₅ on validation set
+        proba = model.predict_proba(X_val)[:, 1]
+        prec, rec, thresholds = precision_recall_curve(y_val, proba)
+        fbeta = np.where(
+            (0.25 * prec + rec) > 0,
+            1.25 * prec * rec / (0.25 * prec + rec), 0.0)
+        best_idx = np.argmax(fbeta[:-1])
+        f05 = fbeta[best_idx]
+        thresh = thresholds[best_idx]
+
+        results.append((cfg, f05, thresh))
+        print(f"  → F₀.₅={f05:.4f} @ thresh={thresh:.4f} "
+              f"(P={prec[best_idx]:.4f} R={rec[best_idx]:.4f})")
+
+        if f05 > best_f05:
+            best_f05 = f05
+            best_model = model
+            best_cfg = cfg
+
+    print(f"\n[XGB] Grid search results:")
+    for cfg, f05, thresh in sorted(results, key=lambda x: -x[1]):
+        marker = " ★" if cfg == best_cfg else ""
+        print(f"  {cfg} → F₀.₅={f05:.4f}{marker}")
+    print(f"[XGB] Best: {best_cfg} → F₀.₅={best_f05:.4f}")
+
+    return best_model
 
 
 def find_best_threshold(model, X_val, y_val, beta=0.5):
@@ -1217,6 +1398,188 @@ def find_best_threshold(model, X_val, y_val, beta=0.5):
     print(f"[Thresh] Best F_{beta}: {fbeta[best]:.4f} @ {thresholds[best]:.4f}  "
           f"(P={prec[best]:.4f} R={rec[best]:.4f})")
     return float(thresholds[best])
+
+
+# ===== HARD NEGATIVE MINING ====================================================
+
+def hard_negative_mining(model, s1_df, pool_df, gt_df, candidates,
+                         score_floor=HARD_NEG_SCORE_FLOOR,
+                         mix_ratio=HARD_NEG_MIX_RATIO,
+                         max_neg_ratio=HARD_NEG_MAX_RATIO):
+    """Mine hard negatives from round-1 model's false positives.
+
+    Protocol:
+      1. Score all training candidate pairs with the round-1 model
+      2. Hard negatives = candidates scored > score_floor AND NOT in ground truth
+      3. Mix: mix_ratio% hard negatives + (1-mix_ratio)% random negatives
+      4. Cap at max_neg_ratio:1 negative-to-positive ratio
+      5. Recompute features for the mixed set
+
+    Args:
+        model: round-1 trained XGBClassifier
+        s1_df, pool_df: DataFrames with name_clean, addr_clean columns
+        gt_df: ground truth DataFrame
+        candidates: {s1_id: [candidate_ids]} from blocking
+        score_floor: only mine FPs scored above this
+        mix_ratio: fraction of negatives that should be hard (0.0–1.0)
+        max_neg_ratio: maximum overall neg:pos ratio
+
+    Returns:
+        (X_r2, y_r2): round-2 training data with hard negatives mixed in
+    """
+    print(f"\n{'='*60}")
+    print("HARD NEGATIVE MINING (Round 2)")
+    print(f"{'='*60}")
+    t0 = time.time()
+
+    # Parse ground truth
+    gt_lookup = {}
+    for _, row in gt_df.iterrows():
+        sid = row["source1_entity_id"]
+        m = row.get("matched_entity_ids", "")
+        gt_lookup[sid] = set(str(m).split(",")) if pd.notna(m) and m else set()
+
+    # Index records
+    pool_name = dict(zip(pool_df["entity_id"], pool_df["name_clean"]))
+    pool_addr = dict(zip(pool_df["entity_id"], pool_df["addr_clean"]))
+    s1_name = dict(zip(s1_df["entity_id"], s1_df["name_clean"]))
+    s1_addr = dict(zip(s1_df["entity_id"], s1_df["addr_clean"]))
+
+    # Score all candidate pairs
+    print("[HardNeg] Scoring all training candidates with round-1 model...")
+    pairs_data = []
+    pairs_meta = []  # (s1_id, cand_id, is_true_match)
+
+    for s1_id, cands in tqdm(candidates.items(), desc="Pair collection", leave=False):
+        if s1_id not in s1_name or s1_id not in gt_lookup:
+            continue
+        n1, a1 = s1_name[s1_id], s1_addr[s1_id]
+        truth = gt_lookup[s1_id]
+        for cid in cands:
+            if cid in pool_name:
+                pairs_data.append((n1, a1, pool_name[cid], pool_addr[cid]))
+                pairs_meta.append((s1_id, cid, cid in truth))
+
+    if not pairs_data:
+        print("[HardNeg] No pairs to mine — skipping")
+        return None, None
+
+    X_all = parallel_compute_features_ordered(pairs_data, desc="HardNeg features")
+    proba = model.predict_proba(X_all)[:, 1]
+
+    # Separate: positives, hard negatives, random negatives
+    positives = []
+    hard_negs = []
+    random_negs = []
+
+    for i, (s1_id, cid, is_true) in enumerate(pairs_meta):
+        if is_true:
+            positives.append(i)
+        elif proba[i] >= score_floor:
+            hard_negs.append(i)  # false positive — scored high but not a match
+        else:
+            random_negs.append(i)
+
+    n_pos = len(positives)
+    n_total_neg = min(n_pos * max_neg_ratio, len(hard_negs) + len(random_negs))
+    n_hard = min(int(n_total_neg * mix_ratio), len(hard_negs))
+    n_random = min(int(n_total_neg * (1 - mix_ratio)), len(random_negs))
+
+    print(f"[HardNeg] Positives: {n_pos:,}")
+    print(f"[HardNeg] Hard negatives available: {len(hard_negs):,} (score >= {score_floor})")
+    print(f"[HardNeg] Using: {n_hard:,} hard + {n_random:,} random negatives")
+
+    # Sample
+    rng = np.random.RandomState(RANDOM_SEED + 1)
+    if len(hard_negs) > n_hard:
+        hard_negs = rng.choice(hard_negs, size=n_hard, replace=False).tolist()
+    else:
+        hard_negs = hard_negs[:n_hard]
+    if len(random_negs) > n_random:
+        random_negs = rng.choice(random_negs, size=n_random, replace=False).tolist()
+    else:
+        random_negs = random_negs[:n_random]
+
+    # Build round-2 training set
+    selected = positives + hard_negs + random_negs
+    X_r2 = X_all[selected]
+    y_r2 = np.array([1] * len(positives) + [0] * (len(hard_negs) + len(random_negs)),
+                     dtype=np.int32)
+
+    print(f"[HardNeg] Round-2 data: {X_r2.shape[0]:,} samples "
+          f"({y_r2.sum():,} pos, {(1-y_r2).sum():,} neg) in {time.time()-t0:.1f}s")
+    return X_r2, y_r2
+
+
+# ===== SINGLETON DETECTION =====================================================
+
+def singleton_post_process(matches, model, s1_df, pool_df, candidates,
+                           max_score_thresh=SINGLETON_MAX_SCORE_THRESHOLD):
+    """Post-process matches to improve singleton detection.
+
+    For entities where the model predicted matches, check if the best candidate
+    score is suspiciously low. If all candidate scores are below max_score_thresh,
+    override to singleton (empty match list). This boosts precision on entities
+    that are borderline.
+
+    For F₀.₅, correctly predicting a singleton = 1.0, false merge on singleton = 0.0.
+    This step trades a small amount of recall for improved precision on marginal cases.
+
+    Args:
+        matches: {s1_id: [matched_ids]} from predict_all
+        model: trained XGBClassifier
+        s1_df, pool_df: DataFrames
+        candidates: {s1_id: [candidate_ids]}
+        max_score_thresh: if best candidate < this, force singleton
+
+    Returns:
+        updated matches dict
+    """
+    print("[Singleton] Running singleton detection post-processing...")
+    t0 = time.time()
+
+    pool_name = dict(zip(pool_df["entity_id"], pool_df["name_clean"]))
+    pool_addr = dict(zip(pool_df["entity_id"], pool_df["addr_clean"]))
+    s1_name = dict(zip(s1_df["entity_id"], s1_df["name_clean"]))
+    s1_addr = dict(zip(s1_df["entity_id"], s1_df["addr_clean"]))
+
+    n_forced_singleton = 0
+    n_checked = 0
+
+    for s1_id, matched in list(matches.items()):
+        if not matched:
+            continue  # already singleton
+
+        cands = candidates.get(s1_id, [])
+        if not cands or s1_id not in s1_name:
+            continue
+
+        n1, a1 = s1_name[s1_id], s1_addr[s1_id]
+
+        # Compute features for all candidates (not just matched)
+        pairs = []
+        for cid in cands:
+            if cid in pool_name:
+                pairs.append((n1, a1, pool_name[cid], pool_addr[cid]))
+
+        if not pairs:
+            continue
+
+        X = np.array([compute_pair_features(*p) for p in pairs], dtype=np.float32)
+        scores = model.predict_proba(X)[:, 1]
+        best_score = scores.max()
+
+        n_checked += 1
+
+        # If best candidate score is below threshold, force singleton
+        if best_score < max_score_thresh:
+            matches[s1_id] = []
+            n_forced_singleton += 1
+
+    print(f"[Singleton] Checked {n_checked:,} entities with matches, "
+          f"forced {n_forced_singleton:,} to singleton "
+          f"(best_score < {max_score_thresh}) in {time.time()-t0:.1f}s")
+    return matches
 
 
 # ===== PREDICTION (parallelised) ==============================================
@@ -1423,9 +1786,9 @@ def run_train(sample_size):
                          size=min(sample_size, len(s1_full)), replace=False)
         s1s = s1_full[s1_full["entity_id"].isin(set(ids))].copy()
         gts = gt_full[gt_full["source1_entity_id"].isin(set(ids))].copy()
-        extra = 30_000  # 30K extra/country — keeps pool manageable
-        # Pool size = must_haves + 30K × n_countries ≈ 100-150K records max
-        # At 150K pool: 2 threads × 500 queries × 150K × 4B = ~600MB ✔
+        extra = 100_000  # 100K extra/country — larger pool for better coverage
+        # Pool size = must_haves + 100K × n_countries ≈ 300-500K records
+        # At 500K pool: 2 threads × 500 queries × 500K × 4B = ~2GB
     countries = set(s1s["country_norm"].unique())
     del s1_full, gt_full; gc.collect()
 
@@ -1484,25 +1847,68 @@ def run_train(sample_size):
             total += len(truth)
     print(f"[Block] Val blocking recall: {found/total:.4f} ({found}/{total})" if total else "[Block] no val matches")
 
-    # ---- 7. Features + training ----
+    # ---- 7. Features + Round 1 training (with grid search) ----
     X_tr, y_tr = build_training_data(s1_tr, pool, gt_tr, tr_cands)
     X_va, y_va = build_training_data(s1_va, pool, gt_va, va_cands)
-    model = train_xgb(X_tr, y_tr, X_va, y_va)
+    model_r1 = train_xgb(X_tr, y_tr, X_va, y_va, grid_search=True)
 
     # top features
-    imp = model.feature_importances_
-    for name, sc in sorted(zip(FEATURE_NAMES, imp), key=lambda x: -x[1])[:10]:
+    imp = model_r1.feature_importances_
+    print("\n[Feature Importance] Top 15:")
+    for name, sc in sorted(zip(FEATURE_NAMES, imp), key=lambda x: -x[1])[:15]:
         print(f"  {name}: {sc:.4f}")
 
-    # ---- 8. Threshold ----
-    threshold = find_best_threshold(model, X_va, y_va)
+    # ---- 8. Round 1 threshold + evaluation ----
+    threshold_r1 = find_best_threshold(model_r1, X_va, y_va)
+    va_matches_r1 = predict_all(model_r1, s1_va, pool, va_cands, threshold_r1)
+    f_score_r1 = evaluate(va_matches_r1, gt_va)
+    print(f"\n  ROUND 1 Val F_0.5 = {f_score_r1:.4f}")
 
-    # ---- 9. Evaluate ----
-    va_matches = predict_all(model, s1_va, pool, va_cands, threshold)
-    f_score = evaluate(va_matches, gt_va)
+    # ---- 9. Hard negative mining → Round 2 ----
+    X_r2, y_r2 = hard_negative_mining(
+        model_r1, s1_tr, pool, gt_tr, tr_cands,
+    )
+
+    if X_r2 is not None and len(X_r2) > 0:
+        model_r2 = train_xgb(X_r2, y_r2, X_va, y_va, grid_search=False)
+        threshold_r2 = find_best_threshold(model_r2, X_va, y_va)
+        va_matches_r2 = predict_all(model_r2, s1_va, pool, va_cands, threshold_r2)
+        f_score_r2 = evaluate(va_matches_r2, gt_va)
+        print(f"  ROUND 2 Val F_0.5 = {f_score_r2:.4f}")
+
+        # Pick the better model
+        if f_score_r2 > f_score_r1:
+            print("[HardNeg] ✓ Round 2 improves F₀.₅ — using round-2 model")
+            model, threshold, f_score = model_r2, threshold_r2, f_score_r2
+            va_matches = va_matches_r2
+        else:
+            print("[HardNeg] ✗ Round 2 did NOT improve — reverting to round-1 model")
+            model, threshold, f_score = model_r1, threshold_r1, f_score_r1
+            va_matches = va_matches_r1
+    else:
+        model, threshold, f_score = model_r1, threshold_r1, f_score_r1
+        va_matches = va_matches_r1
+
+    # ---- 10. Singleton detection post-processing ----
+    va_matches_pre = {k: list(v) for k, v in va_matches.items()}  # copy before singleton
+    va_matches_post = singleton_post_process(
+        va_matches, model, s1_va, pool, va_cands,
+    )
+    f_score_post = evaluate(va_matches_post, gt_va)
+
+    if f_score_post > f_score:
+        print(f"[Singleton] ✓ Singleton detection improved F₀.₅: {f_score:.4f} → {f_score_post:.4f}")
+        f_score = f_score_post
+    else:
+        print(f"[Singleton] ✗ Singleton detection did NOT improve — reverting")
+        # Restore pre-singleton matches
+        for k, v in va_matches_pre.items():
+            va_matches[k] = v
+        # Re-evaluate to confirm
+        f_score = evaluate(va_matches, gt_va)
 
     print(f"\n{'='*72}")
-    print(f"  VALIDATION F_0.5 = {f_score:.4f}   ({time.time()-t_all:.0f}s total)")
+    print(f"  FINAL VALIDATION F_0.5 = {f_score:.4f}   ({time.time()-t_all:.0f}s total)")
     print(f"{'='*72}\n")
 
     os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
@@ -1583,6 +1989,9 @@ def _predict_test_by_country(model, threshold):
         # Predict
         matches = predict_all(model, s1_co, pool_co, cands, threshold)
 
+        # Singleton post-processing
+        matches = singleton_post_process(matches, model, s1_co, pool_co, cands)
+
         # Collect
         for sid in s1_co["entity_id"].values:
             all_matches[sid] = matches.get(sid, [])
@@ -1617,7 +2026,7 @@ def main():
           f"Cache: {CACHE_DIR}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["train","full","predict"], default="train")
-    parser.add_argument("--sample-size", type=int, default=20000)
+    parser.add_argument("--sample-size", type=int, default=100_000)
     parser.add_argument("--clear-cache", action="store_true",
                         help="Delete all cached .parquet files before running")
     args = parser.parse_args()
