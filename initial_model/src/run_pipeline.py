@@ -386,16 +386,40 @@ def load_sources_parallel(*paths) -> list:
 # ===== BLOCKING (TF-IDF + supplementary keys) =================================
 
 def build_tfidf_blocker(pool_df: pd.DataFrame):
-    """Fit TF-IDF vectoriser on pool texts."""
-    print("[Block] Fitting TF-IDF...")
+    """Fit TF-IDF vectoriser on pool texts using Hashing for massive speedups."""
+    from sklearn.pipeline import make_pipeline
+    from sklearn.feature_extraction.text import HashingVectorizer, TfidfTransformer
+    import scipy.sparse as sp
+
+    print("[Block] Fitting TF-IDF (Parallel Hashing)...")
     t0 = time.time()
-    vec = TfidfVectorizer(
+    
+    # HashingVectorizer skips the massive single-threaded vocabulary building step.
+    hasher = HashingVectorizer(
         analyzer="char_wb", ngram_range=(2, 4),
-        max_features=TFIDF_MAX_FEATURES, sublinear_tf=True, dtype=np.float32,
+        n_features=TFIDF_MAX_FEATURES, alternate_sign=False, dtype=np.float32,
     )
-    # sklearn still provides the vocabulary/TF-IDF transform, but all sparse
-    # similarity products are performed by CuPy on the selected CUDA device.
-    pool_mat_cpu = vec.fit_transform(pool_df["combined"].values)
+    
+    texts = pool_df["combined"].values
+    chunk_size = 50_000
+    chunks = [texts[i:i + chunk_size] for i in range(0, len(texts), chunk_size)]
+    
+    def _hash_chunk(chunk):
+        return hasher.transform(chunk)
+        
+    print(f"[Block] Hashing {len(texts):,} records in {len(chunks)} chunks across {min(N_WORKERS, 16)} workers...")
+    with ProcessPoolExecutor(max_workers=min(N_WORKERS, 16)) as pool:
+        mats = list(pool.map(_hash_chunk, chunks))
+        
+    pool_mat_cpu = sp.vstack(mats)
+    
+    # Apply TF-IDF weighting to the hashed features
+    tf = TfidfTransformer(sublinear_tf=True)
+    pool_mat_cpu = tf.fit_transform(pool_mat_cpu)
+    
+    # Bundle them into a pipeline so it acts exactly like TfidfVectorizer for queries
+    vec = make_pipeline(hasher, tf)
+    
     pool_mat_cpu.indptr = pool_mat_cpu.indptr.astype(np.int32)
     pool_mat_cpu.indices = pool_mat_cpu.indices.astype(np.int32)
     
@@ -1010,6 +1034,15 @@ def run_train(sample_size):
     print(f" TRAIN  (sample={sample_size:,}, workers={N_WORKERS})")
     print("="*72)
     t_all = time.time()
+
+    # ---- Check if fully trained model already exists ----
+    if os.path.exists(MODEL_PATH):
+        print(f"[Model] Found existing trained model at {MODEL_PATH}.")
+        print("[Model] Loading from cache and skipping training...")
+        with open(MODEL_PATH, "rb") as f:
+            saved = pickle.load(f)
+        print(f"[Model] Loaded! Validation threshold: {saved['threshold']:.6f}")
+        return saved["model"], saved["threshold"]
 
     # ---- Checkpoint infrastructure ----
     # Each expensive stage saves its output to disk. On restart (e.g. after a
