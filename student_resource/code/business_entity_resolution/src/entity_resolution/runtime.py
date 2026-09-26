@@ -7,8 +7,10 @@ import sys
 
 
 def configure_stdio():
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    # Jupyter's OutStream has no reconfigure(); notebook output is already UTF-8.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
 
 
 def check_cuda():
