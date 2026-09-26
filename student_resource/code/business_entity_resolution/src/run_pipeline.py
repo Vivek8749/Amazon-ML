@@ -129,8 +129,8 @@ LSH_THRESHOLD     = 0.3             # Jaccard similarity threshold for LSH
 LSH_NGRAM_SIZE    = 3               # character n-gram size for MinHash shingling
 
 # ---- Pre-filter configuration ----
-PREFILTER_MAX_CANDIDATES = 200      # max candidates per entity after pre-filter
-PREFILTER_MIN_SCORE      = 0.15     # minimum quick-score to keep a candidate
+PREFILTER_MAX_CANDIDATES = 80       # tighter cap — fewer, better candidates (was 200)
+PREFILTER_MIN_SCORE      = 0.25     # higher floor — drop weak candidates (was 0.15)
 
 # ---- Hard negative mining ----
 HARD_NEG_SCORE_FLOOR = 0.3          # only mine false positives scored above this
