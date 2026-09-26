@@ -412,15 +412,23 @@ def _tfidf_query_chunk(args):
         pool_mat = pickle.load(f)
 
     q_mat = vec.transform(q_texts)
-    scores = csp.csr_matrix(q_mat).dot(pool_mat.T)
+    # Use SpMM (sparse × dense) instead of spGEMM (sparse × sparse) to avoid
+    # CUSPARSE_STATUS_INSUFFICIENT_RESOURCES.  The query batch is small enough
+    # to convert to dense (~few MB), while pool_mat stays sparse on GPU.
+    q_dense = cp.array(q_mat.toarray(), dtype=cp.float32)
+    # sim = q_dense @ pool_mat.T  =>  sim.T = pool_mat @ q_dense.T
+    sim = pool_mat.dot(q_dense.T).T   # (n_queries, n_pool) dense on GPU
+    sim_cpu = cp.asnumpy(sim)
+    del q_dense, sim
+
     results = []
-    for i in range(scores.shape[0]):
-        row = scores.getrow(i)
-        if row.nnz == 0:
+    for i in range(sim_cpu.shape[0]):
+        row = sim_cpu[i]
+        nz = np.nonzero(row)[0]
+        if len(nz) == 0:
             results.append([])
             continue
-        idx = cp.asnumpy(row.indices)
-        dat = cp.asnumpy(row.data)
+        idx, dat = nz, row[nz]
         mask = pool_countries[idx] == q_countries[i]
         fi, fd = idx[mask], dat[mask]
         if len(fd) == 0:
@@ -436,26 +444,34 @@ def _tfidf_query_chunk(args):
 
 def tfidf_block_batch(q_texts, q_countries, vec, pool_mat,
                       pool_ids, pool_countries, top_k=TFIDF_TOP_K):
-    """TF-IDF blocking — row-by-row sparse queries to avoid OOM on large pools."""
-    q_mat = vec.transform(q_texts)
+    """TF-IDF blocking using GPU SpMM (sparse × dense) for speed.
+
+    Instead of spGEMM (sparse × sparse) which requires huge workspace buffers
+    and triggers CUSPARSE_STATUS_INSUFFICIENT_RESOURCES, we convert the small
+    query chunk to dense and use cusparse SpMM.  On A100 this is actually
+    faster because SpMM has better compute utilisation than spGEMM.
+    """
+    q_mat_cpu = vec.transform(q_texts)          # scipy sparse on CPU
     results = []
-    # spGEMM requires large temporary GPU buffers; keep chunks small so a
-    # single matmul doesn't exhaust GPU memory (especially when the pool
-    # matrix has many features).
-    chunk_size = 50
-    n_queries = q_mat.shape[0]
+    chunk_size = 200     # SpMM can handle larger chunks than spGEMM
+    n_queries = q_mat_cpu.shape[0]
 
     for start in range(0, n_queries, chunk_size):
         end = min(start + chunk_size, n_queries)
-        sub_sim = csp.csr_matrix(q_mat[start:end]).dot(pool_mat.T)
+        # Convert small query chunk to dense on GPU (~few MB)
+        q_dense = cp.array(q_mat_cpu[start:end].toarray(), dtype=cp.float32)
+        # SpMM:  sim.T = pool_mat @ q_dense.T  →  sim = result.T
+        sub_sim = cp.asnumpy(pool_mat.dot(q_dense.T).T)   # (chunk, n_pool)
+        del q_dense
 
         for local_i in range(end - start):
             global_i = start + local_i
-            row = sub_sim.getrow(local_i)
-            if row.nnz == 0:
+            row = sub_sim[local_i]
+            nz = np.nonzero(row)[0]
+            if len(nz) == 0:
                 results.append([])
                 continue
-            idx, dat = cp.asnumpy(row.indices), cp.asnumpy(row.data)
+            idx, dat = nz, row[nz]
             mask = pool_countries[idx] == q_countries[global_i]
             fi, fd = idx[mask], dat[mask]
             if len(fd) == 0:
@@ -466,9 +482,7 @@ def tfidf_block_batch(q_texts, q_countries, vec, pool_mat,
                 results.append(pool_ids[fi[top]].tolist())
             else:
                 results.append(pool_ids[fi].tolist())
-        # Release temporary GPU arrays between chunks to prevent OOM.
         del sub_sim
-        cp.get_default_memory_pool().free_all_blocks()
     return results
 
 
@@ -504,15 +518,14 @@ def generate_all_candidates(s1_df, pool_df, vec, pool_mat, top_k=TFIDF_TOP_K, n_
     n = len(s1_df)
     candidates = {}
 
-    # GPU sparse matmul (spGEMM) allocates large temporary buffers; running
-    # multiple batches concurrently from separate threads will quickly exhaust
-    # GPU memory (CUSPARSE_STATUS_INSUFFICIENT_RESOURCES).  Serialize GPU work
-    # with max_workers=1 while still keeping the ThreadPoolExecutor pattern so
-    # the progress bar and candidate-merge logic stay unchanged.
-    gpu_workers = 1
+    # SpMM (sparse × dense) is lightweight on GPU memory, so we can safely
+    # use multiple threads for batch-level concurrency again.  Keep the
+    # thread count moderate to avoid saturating GPU command queues.
+    if n_workers is None:
+        n_workers = min(N_WORKERS, 4)
     batch_ranges = [(i, min(i + BATCH_SIZE, n)) for i in range(0, n, BATCH_SIZE)]
     print(f"[Block] {len(batch_ranges)} batches, {n:,} queries, "
-          f"using {gpu_workers} GPU thread (serialised to avoid spGEMM OOM)...")
+          f"using {min(n_workers, len(batch_ranges))} threads (SpMM)...")
 
     def _process_batch(rng):
         bs, be = rng
@@ -523,7 +536,7 @@ def generate_all_candidates(s1_df, pool_df, vec, pool_mat, top_k=TFIDF_TOP_K, n_
         return bs, be, cands
 
     t0 = time.time()
-    with ThreadPoolExecutor(max_workers=gpu_workers) as pool:
+    with ThreadPoolExecutor(max_workers=min(n_workers, len(batch_ranges))) as pool:
         futures = [pool.submit(_process_batch, rng) for rng in batch_ranges]
         for fut in tqdm(as_completed(futures), total=len(futures), desc="TF-IDF blocking"):
             bs, be, cands_batch = fut.result()
@@ -948,37 +961,76 @@ def run_train(sample_size):
     print("="*72)
     t_all = time.time()
 
-    # ---- 1. Load S1 + GT (fast, small-ish files) ----
-    print("[Data] Loading S1 + GT...")
-    t0 = time.time()
-    s1_full = _load_one_source(TRAIN_S1)
-    gt_full = pd.read_csv(TRAIN_GT, sep="\t", dtype=str)
-    print(f"[Data] S1: {len(s1_full):,}, GT: {len(gt_full):,} in {time.time()-t0:.1f}s")
+    # ---- Checkpoint infrastructure ----
+    # Each expensive stage saves its output to disk. On restart (e.g. after a
+    # Lightning AI session timeout), completed stages are skipped and their
+    # results are restored from the checkpoint files.
+    ckpt_dir = os.path.join(CACHE_DIR, f"train_checkpoints_s{sample_size}")
+    os.makedirs(ckpt_dir, exist_ok=True)
 
-    # ---- 2. Sample S1 ----
-    rng = np.random.RandomState(RANDOM_SEED)
-    ids = rng.choice(s1_full["entity_id"].values,
-                     size=min(sample_size, len(s1_full)), replace=False)
-    s1s = s1_full[s1_full["entity_id"].isin(set(ids))].copy()
-    gts = gt_full[gt_full["source1_entity_id"].isin(set(ids))].copy()
-    countries = set(s1s["country_norm"].unique())
-    del s1_full, gt_full; gc.collect()
+    def _ckpt_path(name):
+        return os.path.join(ckpt_dir, f"{name}.pkl")
 
-    # ---- 3. Find all S2/S3 IDs referenced in GT (must-have for pool) ----
-    must_have = set()
-    for _, row in gts.iterrows():
-        m = row.get("matched_entity_ids", "")
-        if pd.notna(m) and m:
-            must_have.update(str(m).split(","))
-    print(f"[Data] S1 sample: {len(s1s):,}, must-have pool IDs: {len(must_have):,}")
+    def _save_ckpt(name, obj):
+        path = _ckpt_path(name)
+        with open(path, "wb") as f:
+            pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"[CKPT] Saved '{name}' -> {os.path.basename(path)}")
+
+    def _load_ckpt(name):
+        path = _ckpt_path(name)
+        if not os.path.exists(path):
+            return None
+        with open(path, "rb") as f:
+            obj = pickle.load(f)
+        print(f"[CKPT] Restored '{name}' from cache")
+        return obj
+
+    # ---- 1-3. Load S1 + GT, sample, find must-have IDs ----
+    stage1 = _load_ckpt("stage1_data")
+    if stage1 is not None:
+        s1s, gts, countries, must_have = (
+            stage1["s1s"], stage1["gts"], stage1["countries"], stage1["must_have"],
+        )
+    else:
+        print("[Data] Loading S1 + GT...")
+        t0 = time.time()
+        s1_full = _load_one_source(TRAIN_S1)
+        gt_full = pd.read_csv(TRAIN_GT, sep="\t", dtype=str)
+        print(f"[Data] S1: {len(s1_full):,}, GT: {len(gt_full):,} in {time.time()-t0:.1f}s")
+
+        rng = np.random.RandomState(RANDOM_SEED)
+        ids = rng.choice(s1_full["entity_id"].values,
+                         size=min(sample_size, len(s1_full)), replace=False)
+        s1s = s1_full[s1_full["entity_id"].isin(set(ids))].copy()
+        gts = gt_full[gt_full["source1_entity_id"].isin(set(ids))].copy()
+        countries = set(s1s["country_norm"].unique())
+        del s1_full, gt_full; gc.collect()
+
+        must_have = set()
+        for _, row in gts.iterrows():
+            m = row.get("matched_entity_ids", "")
+            if pd.notna(m) and m:
+                must_have.update(str(m).split(","))
+        print(f"[Data] S1 sample: {len(s1s):,}, must-have pool IDs: {len(must_have):,}")
+        _save_ckpt("stage1_data", {
+            "s1s": s1s, "gts": gts, "countries": countries, "must_have": must_have,
+        })
 
     # ---- 4. Smart pool loading (threaded, chunked) ----
-    # Scale extra noise records with sample size
-    extra = max(sample_size * 10, 50_000)
-    pool = _load_pool_sampled(TRAIN_S2, TRAIN_S3, must_have, countries,
-                              extra_per_country=extra)
+    pool = _load_ckpt("stage4_pool")
+    if pool is None:
+        extra = max(sample_size * 10, 50_000)
+        pool = _load_pool_sampled(TRAIN_S2, TRAIN_S3, must_have, countries,
+                                  extra_per_country=extra)
+        _save_ckpt("stage4_pool", pool)
 
     # ---- 5. Train/val split ----
+    rng = np.random.RandomState(RANDOM_SEED)
+    # Reproduce the same RNG state as the original code: first call was
+    # rng.choice for sampling, so we must advance the RNG the same way.
+    _ = rng.choice(np.arange(sample_size),
+                   size=min(sample_size, len(s1s)), replace=False)
     ids2 = s1s["entity_id"].values.copy(); rng.shuffle(ids2)
     nv = max(int(len(ids2) * VAL_FRACTION), 10)
     val_ids   = set(ids2[:nv])
@@ -990,9 +1042,18 @@ def run_train(sample_size):
     print(f"[Split] Train: {len(s1_tr):,}, Val: {len(s1_va):,}")
 
     # ---- 6. Blocking ----
-    vec, pmat = build_tfidf_blocker(pool)
-    tr_cands  = generate_all_candidates(s1_tr, pool, vec, pmat)
-    va_cands  = generate_all_candidates(s1_va, pool, vec, pmat)
+    stage6 = _load_ckpt("stage6_blocking")
+    if stage6 is not None:
+        vec, pmat, tr_cands, va_cands = (
+            stage6["vec"], stage6["pmat"], stage6["tr_cands"], stage6["va_cands"],
+        )
+    else:
+        vec, pmat = build_tfidf_blocker(pool)
+        tr_cands  = generate_all_candidates(s1_tr, pool, vec, pmat)
+        va_cands  = generate_all_candidates(s1_va, pool, vec, pmat)
+        _save_ckpt("stage6_blocking", {
+            "vec": vec, "pmat": pmat, "tr_cands": tr_cands, "va_cands": va_cands,
+        })
 
     # Blocking recall
     gt_va_lk = {}
@@ -1007,8 +1068,18 @@ def run_train(sample_size):
     print(f"[Block] Val blocking recall: {found/total:.4f} ({found}/{total})" if total else "[Block] no val matches")
 
     # ---- 7. Features + training ----
-    X_tr, y_tr = build_training_data(s1_tr, pool, gt_tr, tr_cands)
-    X_va, y_va = build_training_data(s1_va, pool, gt_va, va_cands)
+    stage7 = _load_ckpt("stage7_features")
+    if stage7 is not None:
+        X_tr, y_tr, X_va, y_va = (
+            stage7["X_tr"], stage7["y_tr"], stage7["X_va"], stage7["y_va"],
+        )
+    else:
+        X_tr, y_tr = build_training_data(s1_tr, pool, gt_tr, tr_cands)
+        X_va, y_va = build_training_data(s1_va, pool, gt_va, va_cands)
+        _save_ckpt("stage7_features", {
+            "X_tr": X_tr, "y_tr": y_tr, "X_va": X_va, "y_va": y_va,
+        })
+
     model = train_xgb(X_tr, y_tr, X_va, y_va)
 
     # top features
@@ -1031,6 +1102,15 @@ def run_train(sample_size):
     with open(MODEL_PATH, "wb") as f:
         pickle.dump({"model": model, "threshold": threshold}, f)
     print(f"[Model] Saved -> {MODEL_PATH}")
+
+    # Clean up training checkpoints after successful completion
+    import shutil
+    try:
+        shutil.rmtree(ckpt_dir)
+        print(f"[CKPT] Cleaned up training checkpoints")
+    except OSError:
+        pass
+
     return model, threshold
 
 
