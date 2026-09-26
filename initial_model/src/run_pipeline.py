@@ -44,8 +44,13 @@ from tqdm import tqdm
 import hashlib
 
 warnings.filterwarnings("ignore")
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+# Jupyter replaces stdout/stderr with OutStream, which does not expose the
+# terminal-only ``reconfigure`` method. Keep notebook output untouched while
+# retaining UTF-8 output handling for normal CLI streams.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # CUDA is a hard requirement for the initial model. Do this check before any
 # data is loaded so a CPU-only environment cannot silently run a slower path.
