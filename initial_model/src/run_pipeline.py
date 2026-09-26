@@ -444,25 +444,65 @@ def _tfidf_query_chunk(args):
 
 def tfidf_block_batch(q_texts, q_countries, vec, pool_mat,
                       pool_ids, pool_countries, top_k=TFIDF_TOP_K):
-    """TF-IDF blocking using GPU SpMM (sparse × dense) for speed.
+    """TF-IDF blocking with adaptive GPU strategy.
 
-    Instead of spGEMM (sparse × sparse) which requires huge workspace buffers
-    and triggers CUSPARSE_STATUS_INSUFFICIENT_RESOURCES, we convert the small
-    query chunk to dense and use cusparse SpMM.  On A100 this is actually
-    faster because SpMM has better compute utilisation than spGEMM.
+    Tries fast spGEMM (sparse × sparse) first.  If the pool matrix is too
+    large and cusparse raises INSUFFICIENT_RESOURCES or OOM, permanently
+    switches to SpMM (sparse × dense) for the rest of the call.  This keeps
+    training speed unchanged (small pool → spGEMM) while large test pools
+    fall back gracefully.
     """
-    q_mat_cpu = vec.transform(q_texts)          # scipy sparse on CPU
+    q_mat_cpu = vec.transform(q_texts)
     results = []
-    chunk_size = 200     # SpMM can handle larger chunks than spGEMM
+    chunk_size = 200
     n_queries = q_mat_cpu.shape[0]
+    use_spmm = getattr(tfidf_block_batch, "_use_spmm", False)
 
     for start in range(0, n_queries, chunk_size):
         end = min(start + chunk_size, n_queries)
-        # Convert small query chunk to dense on GPU (~few MB)
+
+        if not use_spmm:
+            # ---- Fast path: spGEMM (sparse × sparse → sparse output) ----
+            try:
+                q_gpu = csp.csr_matrix(q_mat_cpu[start:end])
+                sub_sim = q_gpu.dot(pool_mat.T)
+
+                for local_i in range(end - start):
+                    global_i = start + local_i
+                    row = sub_sim.getrow(local_i)
+                    if row.nnz == 0:
+                        results.append([])
+                        continue
+                    idx, dat = cp.asnumpy(row.indices), cp.asnumpy(row.data)
+                    mask = pool_countries[idx] == q_countries[global_i]
+                    fi, fd = idx[mask], dat[mask]
+                    if len(fd) == 0:
+                        results.append([])
+                        continue
+                    if len(fd) > top_k:
+                        top = np.argpartition(fd, -top_k)[-top_k:]
+                        results.append(pool_ids[fi[top]].tolist())
+                    else:
+                        results.append(pool_ids[fi].tolist())
+                del sub_sim, q_gpu
+                continue  # chunk done via spGEMM
+            except (cp.cuda.memory.OutOfMemoryError, Exception) as exc:
+                exc_str = f"{type(exc).__name__}: {exc}"
+                if "INSUFFICIENT_RESOURCES" in exc_str or "OutOfMemory" in exc_str:
+                    print(f"[Block] spGEMM failed ({type(exc).__name__}), "
+                          f"switching to SpMM fallback for remaining chunks")
+                    use_spmm = True
+                    tfidf_block_batch._use_spmm = True  # persist across calls
+                    cp.get_default_memory_pool().free_all_blocks()
+                    # Fall through to SpMM for this chunk
+                else:
+                    raise
+
+        # ---- Fallback: SpMM (sparse × dense → dense output) ----
         q_dense = cp.array(q_mat_cpu[start:end].toarray(), dtype=cp.float32)
-        # SpMM:  sim.T = pool_mat @ q_dense.T  →  sim = result.T
-        sub_sim = cp.asnumpy(pool_mat.dot(q_dense.T).T)   # (chunk, n_pool)
+        sub_sim = cp.asnumpy(pool_mat.dot(q_dense.T).T)
         del q_dense
+        cp.get_default_memory_pool().free_all_blocks()
 
         for local_i in range(end - start):
             global_i = start + local_i
@@ -518,14 +558,14 @@ def generate_all_candidates(s1_df, pool_df, vec, pool_mat, top_k=TFIDF_TOP_K, n_
     n = len(s1_df)
     candidates = {}
 
-    # SpMM (sparse × dense) is lightweight on GPU memory, so we can safely
-    # use multiple threads for batch-level concurrency again.  Keep the
-    # thread count moderate to avoid saturating GPU command queues.
+    # GPU sparse ops (both spGEMM fast-path and SpMM fallback) should be
+    # serialised to avoid GPU memory contention.  The adaptive strategy inside
+    # tfidf_block_batch handles speed (spGEMM for small pools, SpMM for large).
     if n_workers is None:
-        n_workers = min(N_WORKERS, 4)
+        n_workers = 1
     batch_ranges = [(i, min(i + BATCH_SIZE, n)) for i in range(0, n, BATCH_SIZE)]
     print(f"[Block] {len(batch_ranges)} batches, {n:,} queries, "
-          f"using {min(n_workers, len(batch_ranges))} threads (SpMM)...")
+          f"using {min(n_workers, len(batch_ranges))} GPU thread(s)...")
 
     def _process_batch(rng):
         bs, be = rng
