@@ -100,6 +100,7 @@ TEST_S3  = os.path.join(BASE_DIR, "dataset", "test", "test_source3.tsv")
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "xgb_model.pkl")
 CACHE_DIR  = os.path.join(BASE_DIR, ".cache")       # parquet cache for preprocessed data
+EMBED_CACHE_DIR = os.path.join(CACHE_DIR, "embeddings")  # .npy cache for HNSW embeddings
 
 TFIDF_TOP_K       = 100             # high blocking recall
 TFIDF_MAX_FEATURES= 200_000         # 200K vocab — plenty of RAM
@@ -193,11 +194,53 @@ def _cache_save(path: str, df: pd.DataFrame, suffix: str = "") -> None:
 
 
 def _cache_clear():
-    """Remove all cached parquet files."""
+    """Remove all cached parquet files and embedding caches."""
     if os.path.isdir(CACHE_DIR):
         import shutil
         shutil.rmtree(CACHE_DIR)
-        print("[Cache] Cleared all cached data.")
+        print("[Cache] Cleared all cached data (parquet + embeddings).")
+
+
+# ===== EMBEDDING DISK CACHE ===================================================
+# Saves sentence-transformer embeddings as .npy files keyed on a hash of the
+# input texts.  Turns 14-minute encoding steps into ~1s cache loads on repeat
+# runs with the same pool data.
+
+def _embed_cache_key(texts) -> str:
+    """Create a deterministic hash key from the texts being encoded.
+    Uses a sample-based hash for speed: first 50, last 50, and length."""
+    text_list = texts.tolist() if hasattr(texts, 'tolist') else list(texts)
+    n = len(text_list)
+    # Sample: first 50 + last 50 + total count for a fast fingerprint
+    sample = text_list[:50] + text_list[-50:] if n > 100 else text_list
+    raw = f"{n}:" + "|".join(sample)
+    return hashlib.md5(raw.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _embed_cache_load(cache_key: str) -> np.ndarray | None:
+    """Try loading cached embeddings from .npy file. Returns None on miss."""
+    os.makedirs(EMBED_CACHE_DIR, exist_ok=True)
+    path = os.path.join(EMBED_CACHE_DIR, f"emb_{cache_key}.npy")
+    if os.path.exists(path):
+        t0 = time.time()
+        arr = np.load(path)
+        sz_mb = os.path.getsize(path) / (1024 * 1024)
+        print(f"  [EMBED CACHE HIT] {cache_key} "
+              f"({arr.shape[0]:,} vectors, {sz_mb:.1f} MB in {time.time()-t0:.1f}s)")
+        return arr
+    return None
+
+
+def _embed_cache_save(cache_key: str, embeddings: np.ndarray) -> None:
+    """Save embeddings to .npy cache file."""
+    os.makedirs(EMBED_CACHE_DIR, exist_ok=True)
+    path = os.path.join(EMBED_CACHE_DIR, f"emb_{cache_key}.npy")
+    try:
+        np.save(path, embeddings)
+        sz_mb = os.path.getsize(path) / (1024 * 1024)
+        print(f"  [EMBED CACHE SAVE] {cache_key} ({sz_mb:.1f} MB)")
+    except Exception as e:
+        print(f"  [EMBED CACHE WARN] Could not save: {e}")
 
 # ===== PRE-COMPILED MEGA-REGEX (compiled ONCE at import time) =================
 # Instead of 40+ separate .str.replace() calls (each re-iterating the Series),
@@ -513,9 +556,19 @@ def _load_sbert_model():
     return model
 
 
-def _encode_texts(model, texts, batch_size=HNSW_BATCH_SIZE, desc="Encoding"):
-    """Encode texts to dense vectors using sentence-transformers."""
-    print(f"[HNSW] Encoding {len(texts):,} texts...")
+def _encode_texts(model, texts, batch_size=HNSW_BATCH_SIZE, desc="Encoding",
+                   use_cache=True):
+    """Encode texts to dense vectors using sentence-transformers.
+    Results are cached to disk as .npy files keyed on text content hash."""
+    # --- Try embedding cache first ---
+    cache_key = None
+    if use_cache:
+        cache_key = _embed_cache_key(texts)
+        cached = _embed_cache_load(cache_key)
+        if cached is not None:
+            return cached
+
+    print(f"[HNSW] Encoding {len(texts):,} texts ({desc})...")
     t0 = time.time()
     embeddings = model.encode(
         texts.tolist() if hasattr(texts, 'tolist') else list(texts),
@@ -523,8 +576,14 @@ def _encode_texts(model, texts, batch_size=HNSW_BATCH_SIZE, desc="Encoding"):
         show_progress_bar=True,
         normalize_embeddings=True,  # L2-normalise for cosine similarity via inner product
     )
+    embeddings = embeddings.astype(np.float32)
     print(f"[HNSW] Encoded in {time.time()-t0:.1f}s, shape={embeddings.shape}")
-    return embeddings.astype(np.float32)
+
+    # --- Save to embedding cache ---
+    if use_cache and cache_key:
+        _embed_cache_save(cache_key, embeddings)
+
+    return embeddings
 
 
 def build_hnsw_index(pool_df, sbert_model):
