@@ -6,20 +6,21 @@ import os
 # ΓöÇΓöÇΓöÇ paths ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
-TRAIN_S1 = os.path.join(BASE_DIR, "dataset", "train", "train_source1.tsv")
-TRAIN_S2 = os.path.join(BASE_DIR, "dataset", "train", "train_source2.tsv")
-TRAIN_S3 = os.path.join(BASE_DIR, "dataset", "train", "train_source3.tsv")
-TRAIN_GT = os.path.join(BASE_DIR, "dataset", "train", "train_ground_truth.tsv")
+TRAIN_S1 = os.path.join(BASE_DIR, "student_resource", "dataset", "train", "train_source1.tsv")
+TRAIN_S2 = os.path.join(BASE_DIR, "student_resource", "dataset", "train", "train_source2.tsv")
+TRAIN_S3 = os.path.join(BASE_DIR, "student_resource", "dataset", "train", "train_source3.tsv")
+TRAIN_GT = os.path.join(BASE_DIR, "student_resource", "dataset", "train", "train_ground_truth.tsv")
 
-TEST_S1 = os.path.join(BASE_DIR, "dataset", "test", "test_source1.tsv")
-TEST_S2 = os.path.join(BASE_DIR, "dataset", "test", "test_source2.tsv")
-TEST_S3 = os.path.join(BASE_DIR, "dataset", "test", "test_source3.tsv")
+TEST_S1 = os.path.join(BASE_DIR, "student_resource", "dataset", "test", "test_source1.tsv")
+TEST_S2 = os.path.join(BASE_DIR, "student_resource", "dataset", "test", "test_source2.tsv")
+TEST_S3 = os.path.join(BASE_DIR, "student_resource", "dataset", "test", "test_source3.tsv")
 
-OUTPUT_DIR = os.path.join(BASE_DIR, "output")
+OUTPUT_DIR = os.path.join(BASE_DIR, "student_resource", "output")
 MATCHING_RESULTS = os.path.join(OUTPUT_DIR, "matching_results.tsv")
 CANDIDATE_PAIRS = os.path.join(OUTPUT_DIR, "candidate_pairs.tsv")
 
-MODEL_DIR = os.path.join(BASE_DIR, "code", "business_entity_resolution", "models")
+MODEL_DIR = os.path.join(BASE_DIR, "student_resource", "code", "business_entity_resolution", "models")
+
 
 # ΓöÇΓöÇΓöÇ pipeline parameters ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 # Blocking

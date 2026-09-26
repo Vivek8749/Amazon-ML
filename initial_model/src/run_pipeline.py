@@ -42,14 +42,15 @@ sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # ===== CONFIGURATION ==========================================================
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-TRAIN_S1 = os.path.join(BASE_DIR, "dataset", "train", "train_source1.tsv")
-TRAIN_S2 = os.path.join(BASE_DIR, "dataset", "train", "train_source2.tsv")
-TRAIN_S3 = os.path.join(BASE_DIR, "dataset", "train", "train_source3.tsv")
-TRAIN_GT = os.path.join(BASE_DIR, "dataset", "train", "train_ground_truth.tsv")
-TEST_S1  = os.path.join(BASE_DIR, "dataset", "test", "test_source1.tsv")
-TEST_S2  = os.path.join(BASE_DIR, "dataset", "test", "test_source2.tsv")
-TEST_S3  = os.path.join(BASE_DIR, "dataset", "test", "test_source3.tsv")
-OUTPUT_DIR = os.path.join(BASE_DIR, "output")
+TRAIN_S1 = os.path.join(BASE_DIR, "student_resource", "dataset", "train", "train_source1.tsv")
+TRAIN_S2 = os.path.join(BASE_DIR, "student_resource", "dataset", "train", "train_source2.tsv")
+TRAIN_S3 = os.path.join(BASE_DIR, "student_resource", "dataset", "train", "train_source3.tsv")
+TRAIN_GT = os.path.join(BASE_DIR, "student_resource", "dataset", "train", "train_ground_truth.tsv")
+TEST_S1  = os.path.join(BASE_DIR, "student_resource", "dataset", "test", "test_source1.tsv")
+TEST_S2  = os.path.join(BASE_DIR, "student_resource", "dataset", "test", "test_source2.tsv")
+TEST_S3  = os.path.join(BASE_DIR, "student_resource", "dataset", "test", "test_source3.tsv")
+OUTPUT_DIR = os.path.join(BASE_DIR, "student_resource", "output")
+
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "xgb_model.pkl")
 
 TFIDF_TOP_K       = 20
