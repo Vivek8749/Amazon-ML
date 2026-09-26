@@ -38,11 +38,13 @@ except (ImportError, ModuleNotFoundError):
 if _nvrtc_spec and _nvrtc_spec.origin:
     _nvrtc_lib = os.path.join(os.path.dirname(_nvrtc_spec.origin), "lib")
     if os.path.isdir(_nvrtc_lib):
-        _loader_path = os.environ.get("LD_LIBRARY_PATH", "")
-        if _nvrtc_lib not in _loader_path.split(os.pathsep):
-            os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(
-                part for part in (_nvrtc_lib, _loader_path) if part
-            )
+        import ctypes
+        import glob
+        for lib in glob.glob(os.path.join(_nvrtc_lib, "libnvrtc*.so*")):
+            try:
+                ctypes.CDLL(lib)
+            except OSError:
+                pass
 try:
     import cupy as cp
     import cupyx.scipy.sparse as csp
