@@ -154,6 +154,20 @@ def _cache_clear():
         print("[Cache] Cleared all cached data.")
 
 
+def _pool_cache_path(s2_path, s3_path, must_have_ids, countries,
+                     extra_per_country, seed):
+    """Return a stable cache path for a sampled training pool."""
+    ids_digest = hashlib.md5(
+        "\n".join(sorted(map(str, must_have_ids))).encode("utf-8")
+    ).hexdigest()[:16]
+    raw = ":".join([
+        _file_fingerprint(s2_path), _file_fingerprint(s3_path), ids_digest,
+        ",".join(sorted(countries)), str(extra_per_country), str(seed),
+    ])
+    key = hashlib.md5(raw.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(CACHE_DIR, f"sampled_pool_{key}.parquet")
+
+
 # ===== FAST VECTORISED PREPROCESSING ==========================================
 
 def fast_preprocess(df: pd.DataFrame) -> pd.DataFrame:
@@ -797,7 +811,17 @@ def _load_pool_sampled(s2_path, s3_path, must_have_ids, countries,
     print(f"[Pool] Loading sampled pool (must_have={len(must_have_ids):,}, "
           f"extra/country={extra_per_country:,})...")
     t0 = time.time()
+    cache_path = _pool_cache_path(
+        s2_path, s3_path, must_have_ids, countries, extra_per_country, seed
+    )
+    if os.path.exists(cache_path):
+        pool = pd.read_parquet(cache_path)
+        print(f"[Pool CACHE HIT] {len(pool):,} records in {time.time()-t0:.1f}s")
+        return pool
+
     must = set(must_have_ids)
+    # Keep raw rows here. Preprocessing only after sampling avoids applying
+    # dozens of regex passes to millions of records that will be discarded.
     frames_must = []
     frames_rand = {c: [] for c in countries}
     rand_counts = {c: 0 for c in countries}
@@ -806,7 +830,7 @@ def _load_pool_sampled(s2_path, s3_path, must_have_ids, countries,
         tag = os.path.basename(path)
         for chunk in tqdm(pd.read_csv(path, sep="\t", dtype=str, chunksize=200_000),
                           desc=f"Scanning {tag}", unit="chunk"):
-            chunk = fast_preprocess(chunk)
+            country_norm = chunk["country"].fillna("").str.lower().str.strip()
             # Must-have rows
             mask_must = chunk["entity_id"].isin(must)
             if mask_must.any():
@@ -816,7 +840,7 @@ def _load_pool_sampled(s2_path, s3_path, must_have_ids, countries,
             for co in countries:
                 if rand_counts[co] >= extra_per_country:
                     continue
-                co_rows = rest[rest["country_norm"] == co]
+                co_rows = rest[country_norm[rest.index] == co]
                 need = extra_per_country - rand_counts[co]
                 if len(co_rows) > need:
                     co_rows = co_rows.sample(n=need, random_state=seed)
@@ -829,6 +853,13 @@ def _load_pool_sampled(s2_path, s3_path, must_have_ids, countries,
     for co in countries:
         all_frames.extend(frames_rand[co])
     pool = pd.concat(all_frames, ignore_index=True).drop_duplicates(subset="entity_id")
+    pool = fast_preprocess(pool)
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    try:
+        pool.to_parquet(cache_path, engine="pyarrow", compression="snappy", index=False)
+        print(f"[Pool CACHE SAVE] {os.path.basename(cache_path)}")
+    except Exception as exc:
+        print(f"[Pool CACHE WARN] Could not save cache: {exc}")
     print(f"[Pool] {len(pool):,} records in {time.time()-t0:.1f}s")
     return pool
 
