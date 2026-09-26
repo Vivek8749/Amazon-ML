@@ -29,22 +29,74 @@ from functools import partial
 
 import numpy as np
 import pandas as pd
-# NVIDIA's pip wheels keep NVRTC under site-packages/nvidia/.../lib rather than
-# the system loader path. Add that directory before CuPy initializes.
+# ---------------------------------------------------------------------------
+# Pre-load NVRTC so CuPy can JIT-compile CUDA kernels.
+# Lightning AI (and similar hosted GPU images) ship CUDA drivers but often
+# omit libnvrtc from the default linker search path.  We search every common
+# location and force-load the library with RTLD_GLOBAL so that subsequent
+# dlopen() calls by CuPy can find the symbols.
+# ---------------------------------------------------------------------------
+import ctypes
+import glob as _glob
+
+_NVRTC_LOADED = False
+
+def _try_load_nvrtc(path):
+    """Try to load a single .so and return True on success."""
+    global _NVRTC_LOADED
+    if _NVRTC_LOADED:
+        return True
+    try:
+        ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+        _NVRTC_LOADED = True
+        return True
+    except OSError:
+        return False
+
+# 1. pip nvidia package  (nvidia-cuda-nvrtc-cu12)
+#    nvidia.cuda_nvrtc is a namespace package so spec.origin is None.
+#    Use the module's __path__ attribute instead.
 try:
-    _nvrtc_spec = importlib.util.find_spec("nvidia.cuda_nvrtc")
-except (ImportError, ModuleNotFoundError):
-    _nvrtc_spec = None
-if _nvrtc_spec and _nvrtc_spec.origin:
-    _nvrtc_lib = os.path.join(os.path.dirname(_nvrtc_spec.origin), "lib")
-    if os.path.isdir(_nvrtc_lib):
-        import ctypes
-        import glob
-        for lib in glob.glob(os.path.join(_nvrtc_lib, "libnvrtc*.so*")):
-            try:
-                ctypes.CDLL(lib)
-            except OSError:
-                pass
+    import nvidia.cuda_nvrtc as _nvrtc_mod
+    for _pkg_dir in getattr(_nvrtc_mod, "__path__", []):
+        for _search in (
+            os.path.join(_pkg_dir, "lib"),   # .../nvidia/cuda_nvrtc/lib/
+            _pkg_dir,                         # .../nvidia/cuda_nvrtc/
+        ):
+            if os.path.isdir(_search):
+                for _so in sorted(_glob.glob(os.path.join(_search, "libnvrtc*.so*"))):
+                    _try_load_nvrtc(_so)
+except ImportError:
+    pass
+
+# 2. Search site-packages/nvidia/cuda_nvrtc/lib/ directly
+if not _NVRTC_LOADED:
+    import site as _site
+    for _sp in _site.getsitepackages() + [_site.getusersitepackages()]:
+        _nvrtc_site = os.path.join(_sp, "nvidia", "cuda_nvrtc", "lib")
+        if os.path.isdir(_nvrtc_site):
+            for _so in sorted(_glob.glob(os.path.join(_nvrtc_site, "libnvrtc*.so*"))):
+                _try_load_nvrtc(_so)
+
+# 3. Conda environment  (e.g. $CONDA_PREFIX/lib)
+if not _NVRTC_LOADED:
+    _conda = os.environ.get("CONDA_PREFIX", "")
+    if _conda:
+        for _so in sorted(_glob.glob(os.path.join(_conda, "lib", "libnvrtc*.so*"))):
+            _try_load_nvrtc(_so)
+
+# 4. System CUDA toolkit  (/usr/local/cuda*/lib64 and targets/)
+if not _NVRTC_LOADED:
+    for _pattern in ("/usr/local/cuda*/lib64", "/usr/local/cuda*/targets/*/lib"):
+        for _cuda_dir in sorted(_glob.glob(_pattern)):
+            for _so in sorted(_glob.glob(os.path.join(_cuda_dir, "libnvrtc*.so*"))):
+                _try_load_nvrtc(_so)
+
+# 5. Common Lightning AI / cloud image paths
+if not _NVRTC_LOADED:
+    for _extra in ("/usr/lib/x86_64-linux-gnu", "/usr/lib64"):
+        for _so in sorted(_glob.glob(os.path.join(_extra, "libnvrtc*.so*"))):
+            _try_load_nvrtc(_so)
 try:
     import cupy as cp
     import cupyx.scipy.sparse as csp
