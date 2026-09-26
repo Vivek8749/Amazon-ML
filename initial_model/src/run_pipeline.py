@@ -207,7 +207,8 @@ def build_tfidf_blocker(pool_df: pd.DataFrame):
         max_features=TFIDF_MAX_FEATURES, sublinear_tf=True, dtype=np.float32,
     )
     pool_mat = vec.fit_transform(pool_df["combined"].values)
-    print(f"[Block] Matrix {pool_mat.shape} in {time.time()-t0:.1f}s")
+    pool_mat = pool_mat.astype(np.float16)   # halve memory (float32 -> float16)
+    print(f"[Block] Matrix {pool_mat.shape} (float16) in {time.time()-t0:.1f}s")
     return vec, pool_mat
 
 
@@ -888,19 +889,9 @@ def _predict_test_by_country(model, threshold):
                 country_matches[sid] = []
                 country_candidates[sid] = []
         else:
-            # For large pools (>500K), reduce threads to prevent OOM
-            saved_workers = N_WORKERS
-            if len(pool_co) > 500_000:
-                effective_workers = min(4, N_WORKERS)
-                print(f"[Memory] Large pool ({len(pool_co):,}) — "
-                      f"reducing threads from {N_WORKERS} to {effective_workers}")
-            else:
-                effective_workers = N_WORKERS
-
             # Block
             vec, pmat = build_tfidf_blocker(pool_co)
-            cands = generate_all_candidates(s1_co, pool_co, vec, pmat,
-                                            n_workers=effective_workers)
+            cands = generate_all_candidates(s1_co, pool_co, vec, pmat)
 
             # Predict
             matches = predict_all(model, s1_co, pool_co, cands, threshold)
