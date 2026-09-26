@@ -35,6 +35,7 @@ from xgboost import XGBClassifier
 from rapidfuzz import fuzz
 from rapidfuzz.distance import Levenshtein, JaroWinkler
 from tqdm import tqdm
+import hashlib
 
 warnings.filterwarnings("ignore")
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -61,8 +62,60 @@ VAL_FRACTION      = 0.1
 BATCH_SIZE        = 1_000       # TF-IDF query batch (fine-grained for smooth progress)
 FEAT_CHUNK        = 25_000      # feature-computation chunk for workers
 N_WORKERS         = min(mp.cpu_count(), 16)   # cap so we don't OOM
+CACHE_DIR         = os.path.join(BASE_DIR, ".cache")  # parquet cache for preprocessed data
 
 # config print moved to main() to avoid worker spam
+
+
+# ===== PARQUET DISK CACHE =====================================================
+# Preprocessing regex is expensive (~minutes for large files).
+# After first run, save preprocessed DataFrames as .parquet files.
+# Subsequent runs load parquet in ~5-15s instead of re-processing.
+
+def _file_fingerprint(path: str) -> str:
+    """Fast fingerprint: basename + size + mtime."""
+    st = os.stat(path)
+    raw = f"{os.path.basename(path)}:{st.st_size}:{int(st.st_mtime)}"
+    return hashlib.md5(raw.encode()).hexdigest()[:12]
+
+
+def _cache_path(path: str) -> str:
+    fp = _file_fingerprint(path)
+    tag = os.path.splitext(os.path.basename(path))[0]
+    return os.path.join(CACHE_DIR, f"{tag}_{fp}.parquet")
+
+
+def _cache_load(path: str) -> pd.DataFrame | None:
+    """Try loading preprocessed data from parquet cache."""
+    cp = _cache_path(path)
+    if os.path.exists(cp):
+        t0 = time.time()
+        df = pd.read_parquet(cp)
+        print(f"  [CACHE HIT] {os.path.basename(path)} "
+              f"({len(df):,} rows in {time.time()-t0:.1f}s)")
+        return df
+    return None
+
+
+def _cache_save(path: str, df: pd.DataFrame) -> None:
+    """Save preprocessed DataFrame to parquet cache."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cp = _cache_path(path)
+    try:
+        df.to_parquet(cp, engine="pyarrow", compression="snappy", index=False)
+        sz_mb = os.path.getsize(cp) / (1024 * 1024)
+        print(f"  [CACHE SAVE] {os.path.basename(cp)} ({sz_mb:.1f} MB)")
+    except Exception as e:
+        print(f"  [CACHE WARN] Could not save cache: {e}")
+
+
+def _cache_clear():
+    """Remove all cached parquet files."""
+    if os.path.isdir(CACHE_DIR):
+        import shutil
+        shutil.rmtree(CACHE_DIR)
+        print("[Cache] Cleared all cached data.")
+
 
 # ===== FAST VECTORISED PREPROCESSING ==========================================
 
@@ -163,10 +216,19 @@ def fast_preprocess(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _load_one_source(path: str) -> pd.DataFrame:
-    """Load + preprocess one TSV with progress bar for large files."""
+def _load_one_source(path: str, use_cache: bool = True) -> pd.DataFrame:
+    """Load + preprocess one TSV, with parquet disk caching."""
     tag = os.path.basename(path)
     t0 = time.time()
+
+    # --- Try cache first ---
+    if use_cache:
+        cached = _cache_load(path)
+        if cached is not None:
+            return cached
+
+    # --- Cache miss: load from TSV + preprocess ---
+    print(f"  [CACHE MISS] {tag} — loading from TSV...")
     fsize = os.path.getsize(path) if os.path.exists(path) else 0
     if fsize > 20 * 1024 * 1024:
         chunks = []
@@ -179,6 +241,11 @@ def _load_one_source(path: str) -> pd.DataFrame:
         df = fast_preprocess(df)
     dt = time.time() - t0
     print(f"  [{tag}] {len(df):,} rows in {dt:.1f}s")
+
+    # --- Save to cache for next run ---
+    if use_cache:
+        _cache_save(path, df)
+
     return df
 
 
@@ -207,8 +274,10 @@ def build_tfidf_blocker(pool_df: pd.DataFrame):
         max_features=TFIDF_MAX_FEATURES, sublinear_tf=True, dtype=np.float32,
     )
     pool_mat = vec.fit_transform(pool_df["combined"].values)
-    pool_mat = pool_mat.astype(np.float16)   # halve memory (float32 -> float16)
-    print(f"[Block] Matrix {pool_mat.shape} (float16) in {time.time()-t0:.1f}s")
+    # Ensure int32 indices to save memory (scipy default can be int64 on large data)
+    pool_mat.indptr  = pool_mat.indptr.astype(np.int32)
+    pool_mat.indices = pool_mat.indices.astype(np.int32)
+    print(f"[Block] Matrix {pool_mat.shape} in {time.time()-t0:.1f}s")
     return vec, pool_mat
 
 
@@ -865,17 +934,14 @@ def _predict_test_by_country(model, threshold):
         s1_co = ts1[ts1["country_norm"] == country].copy()
         print(f"[Test/{country}] S1 entities: {len(s1_co):,}")
 
-        # Load pool for this country only (chunked)
+        # Load pool for this country (use cache for fast restarts)
         pool_frames = []
         for path in (TEST_S2, TEST_S3):
-            tag = os.path.basename(path)
-            for chunk in tqdm(pd.read_csv(path, sep="\t", dtype=str, chunksize=300_000),
-                              desc=f"Scanning {tag} ({country})", unit="chunk"):
-                chunk = fast_preprocess(chunk)
-                co_chunk = chunk[chunk["country_norm"] == country]
-                if len(co_chunk) > 0:
-                    pool_frames.append(co_chunk)
-            print(f"  [{tag}] scanned for {country}")
+            full_df = _load_one_source(path, use_cache=True)
+            co_chunk = full_df[full_df["country_norm"] == country]
+            if len(co_chunk) > 0:
+                pool_frames.append(co_chunk)
+            del full_df; gc.collect()
 
         pool_co = pd.concat(pool_frames, ignore_index=True) if pool_frames else pd.DataFrame()
         del pool_frames; gc.collect()
@@ -934,11 +1000,16 @@ def run_predict():
 
 
 def main():
-    print(f"[Config] Workers: {N_WORKERS}, CPUs: {mp.cpu_count()}")
+    print(f"[Config] Workers: {N_WORKERS}, CPUs: {mp.cpu_count()}, "
+          f"Cache: {CACHE_DIR}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["train","full","predict"], default="train")
     parser.add_argument("--sample-size", type=int, default=20000)
+    parser.add_argument("--clear-cache", action="store_true",
+                        help="Delete all cached .parquet files before running")
     args = parser.parse_args()
+    if args.clear_cache:
+        _cache_clear()
     {"train": lambda: run_train(args.sample_size),
      "full":  lambda: run_full(args.sample_size),
      "predict": run_predict}[args.mode]()
