@@ -35,6 +35,18 @@ except Exception as exc:
     raise RuntimeError(
         "The initial model requires CuPy. Install initial_model/requirements.txt."
     ) from exc
+
+
+def cuda_device_name(device) -> str:
+    """Return the CUDA device name across CuPy versions."""
+    # Newer CuPy versions expose ``Device.name``; older/hosted builds (such as
+    # Lightning AI images) expose the same value through the CUDA runtime API.
+    name = getattr(device, "name", None)
+    if name:
+        return name.decode() if isinstance(name, bytes) else str(name)
+    props = cp.cuda.runtime.getDeviceProperties(device.id)
+    name = props.get("name", "CUDA device") if isinstance(props, dict) else "CUDA device"
+    return name.decode() if isinstance(name, bytes) else str(name)
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import precision_recall_curve
 from xgboost import XGBClassifier
@@ -58,7 +70,7 @@ try:
     if not cp.cuda.is_available():
         raise RuntimeError("no CUDA device is available")
     CUDA_DEVICE = cp.cuda.Device()
-    print(f"[GPU] CUDA device: {CUDA_DEVICE.name}")
+    print(f"[GPU] CUDA device: {cuda_device_name(CUDA_DEVICE)}")
 except Exception as exc:
     raise RuntimeError(
         "The initial model requires an NVIDIA GPU and a working CUDA runtime. "
