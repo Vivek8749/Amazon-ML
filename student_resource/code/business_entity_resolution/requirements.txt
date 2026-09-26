@@ -10,5 +10,7 @@ sentence-transformers>=2.2.0
 hnswlib>=0.7.0
 datasketch>=1.6.0
 jellyfish>=1.0.0
-# Required for the CUDA execution path used by the pipeline.
-cupy-cuda12x>=13.0.0
+anyascii>=0.3.2
+# Required for the CUDA execution path used by the pipeline. The [ctk] extra
+# ships cuSPARSE/cuRAND/nvJitLink, which GPU TF-IDF retrieval needs.
+cupy-cuda12x[ctk]>=13.0.0

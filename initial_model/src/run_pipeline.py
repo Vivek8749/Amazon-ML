@@ -23,6 +23,8 @@ import pickle
 import warnings
 import multiprocessing as mp
 import importlib.util
+import ctypes
+import glob
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from functools import partial
@@ -31,18 +33,34 @@ import numpy as np
 import pandas as pd
 # NVIDIA's pip wheels keep NVRTC under site-packages/nvidia/.../lib rather than
 # the system loader path. Add that directory before CuPy initializes.
+_nvrtc_dirs = []
 try:
     _nvrtc_spec = importlib.util.find_spec("nvidia.cuda_nvrtc")
 except (ImportError, ModuleNotFoundError):
     _nvrtc_spec = None
 if _nvrtc_spec and _nvrtc_spec.origin:
-    _nvrtc_lib = os.path.join(os.path.dirname(_nvrtc_spec.origin), "lib")
-    if os.path.isdir(_nvrtc_lib):
-        _loader_path = os.environ.get("LD_LIBRARY_PATH", "")
-        if _nvrtc_lib not in _loader_path.split(os.pathsep):
-            os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(
-                part for part in (_nvrtc_lib, _loader_path) if part
-            )
+    _nvrtc_dirs.append(os.path.join(os.path.dirname(_nvrtc_spec.origin), "lib"))
+# Also support system CUDA installs commonly used by hosted GPU workspaces.
+_nvrtc_dirs.extend(glob.glob("/usr/local/cuda*/lib64"))
+_nvrtc_dirs.extend(glob.glob("/usr/local/cuda*/targets/*/lib"))
+_nvrtc_dirs = [p for p in dict.fromkeys(_nvrtc_dirs) if os.path.isdir(p)]
+if _nvrtc_dirs:
+    _loader_path = os.environ.get("LD_LIBRARY_PATH", "")
+    _new_loader_path = os.pathsep.join(
+        [p for p in _nvrtc_dirs if p not in _loader_path.split(os.pathsep)]
+        + ([_loader_path] if _loader_path else [])
+    )
+    os.environ["LD_LIBRARY_PATH"] = _new_loader_path
+    # LD_LIBRARY_PATH is fixed at process startup on many Linux images.
+    # Preload the libraries so CuPy's later soft-link lookup works in Jupyter.
+    _dl_mode = getattr(ctypes, "RTLD_GLOBAL", 0)
+    for _nvrtc_dir in _nvrtc_dirs:
+        for _pattern in ("libnvrtc-builtins.so*", "libnvrtc.so*"):
+            for _library in sorted(glob.glob(os.path.join(_nvrtc_dir, _pattern))):
+                try:
+                    ctypes.CDLL(_library, mode=_dl_mode)
+                except OSError:
+                    pass
 try:
     import cupy as cp
     import cupyx.scipy.sparse as csp

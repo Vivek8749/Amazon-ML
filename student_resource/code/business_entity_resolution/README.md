@@ -10,17 +10,20 @@ precision-heavy F₀.₅ metric.
 ## Architecture
 
 ```
-run_pipeline.py (standalone, self-contained entry point)
+run_pipeline.py → entity_resolution/ (see Code Layout below)
 │
 ├── Preprocessing
+│   ├── Transliteration to ASCII (Devanagari/Kannada → Latin, é → e) via anyascii
 │   ├── Vectorised text cleaning (lowercase, bracket/symbol handling)
 │   ├── Legal suffix normalisation (Corporation→corp, Ltd.→ltd, S.A.R.L.→sarl)
 │   └── Address abbreviation normalisation (Street→st, Boulevard→blvd, etc.)
 │
-├── Blocking / Candidate Generation
-│   ├── TF-IDF character n-gram (2–4) cosine similarity (top-K per query)
-│   ├── Name-key inverted index (first 5 characters + country)
-│   └── Address-number inverted index (sorted numeric tokens + country)
+├── Blocking / Candidate Generation (per country, exact top-K on GPU)
+│   ├── Char 2–4-gram TF-IDF cosine over name + address (top 30)
+│   ├── Word 1–2-gram TF-IDF cosine over name + address (top 30)
+│   ├── Sentence-transformer + HNSW dense retrieval (if installed)
+│   ├── Optional, off by default: name-only TF-IDF, key indexes, MinHash/LSH
+│   └── Union → cheap pre-filter cap (100)
 │
 ├── Feature Engineering (29 similarity features)
 │   ├── Name: Levenshtein, Jaro-Winkler, token-sort/set/partial ratios,
@@ -41,20 +44,38 @@ run_pipeline.py (standalone, self-contained entry point)
     └── Country-by-country processing for memory efficiency
 ```
 
-### Modular Code (Alternative Reference)
+### Code Layout
 
-The `src/` directory also contains a modular version of the pipeline:
+`run_pipeline.py` is a thin CLI; the implementation is the `entity_resolution`
+package, one module per pipeline stage:
 
-| File               | Purpose                                                 |
-| ------------------ | ------------------------------------------------------- |
-| `config.py`        | Centralised configuration constants                     |
-| `preprocessing.py` | Text normalisation with legal suffixes, address abbrevs |
-| `blocking.py`      | `TFIDFBlocker` class + supplementary index generation   |
-| `features.py`      | 33 similarity features via `compute_features()`         |
-| `matcher.py`       | XGBoost train/predict with threshold optimisation       |
-| `evaluation.py`    | Macro-averaged F₀.₅ scoring                             |
-| `io_utils.py`      | TSV output formatting                                   |
-| `pipeline.py`      | Orchestration (train/full/predict modes)                |
+```
+src/
+├── run_pipeline.py            CLI entry point (--mode train|full|predict)
+├── eval_blocking.py           CLI: blocking recall/cost at realistic pool density
+├── models/xgb_model.pkl       saved model + threshold
+└── entity_resolution/
+    ├── config.py              paths and all hyperparameters
+    ├── runtime.py             UTF-8 stdio, CUDA check, optional-dependency report
+    ├── cache.py               parquet cache (preprocessed sources) + embedding cache
+    ├── preprocessing.py       name/address normalisation (fast_preprocess)
+    ├── data.py                source loading, training-pool sampling,
+    │                          ground-truth parsing, output TSV writing
+    ├── blocking/
+    │   ├── tfidf.py           TfidfIndex: char/word/name TF-IDF, exact per-country
+    │   │                      top-K (CuPy SpMM + block top-K, SciPy fallback)
+    │   ├── dense.py           sentence-transformer embeddings + HNSW
+    │   ├── minhash.py         MinHash/LSH per country
+    │   ├── prefilter.py       cheap 3-signal score, caps candidates per entity
+    │   └── candidates.py      build_blockers + generate_all_candidates (union, pre-filter)
+    ├── blocking_eval.py       per-strategy recall / cost report (used by eval_blocking.py)
+    ├── features.py            pairwise similarity features (parallel workers)
+    ├── training.py            training pairs, XGBoost grid search,
+    │                          F0.5 threshold, hard-negative mining
+    ├── inference.py           predict_all, singleton post-processing
+    ├── evaluation.py          macro F0.5 (leaderboard metric)
+    └── pipeline.py            run_train / predict_test_by_country / run_full / run_predict
+```
 
 ## Requirements
 
@@ -120,7 +141,22 @@ python code/business_entity_resolution/src/run_pipeline.py --mode predict
 
 Loads the saved model from `src/models/xgb_model.pkl` and runs test prediction.
 
-### 4. Validate Output
+### 4. Evaluate Blocking (recall vs. cost)
+
+```bash
+cd code/business_entity_resolution/src
+python eval_blocking.py --country us --n-queries 5000                       # full pool
+python eval_blocking.py --country india --n-queries 1000 --pool-fraction 0.05 --out india.json
+```
+
+Blocks S1 training queries against the country's S2+S3 pool (full, or a
+Bernoulli sample with every true match kept) and prints, per strategy, pair
+and entity recall, the share of true pairs no other strategy finds,
+candidates per entity and ms per query, plus a pre-filter cap → recall curve.
+Use the full pool (`--pool-fraction 1.0`) for decisions: the training
+pipeline's sampled pool overstates blocking recall.
+
+### 5. Validate Output
 
 ```bash
 python utils/validate_submission.py \
@@ -142,13 +178,24 @@ python utils/validate_submission.py \
 3. **Character n-gram TF-IDF** — `char_wb` analyser with (2,4)-grams handles
    typos, abbreviations, and transliterations better than word-level TF-IDF.
 
-4. **Multi-strategy blocking** — TF-IDF is supplemented by name-key and
-   address-number inverted indexes to catch cases where character similarity
-   is low but exact tokens overlap.
+4. **Dense scoring for TF-IDF retrieval** — common character n-grams make
+   every query-vs-pool similarity row ~100% dense, so sparse×sparse scipy
+   blocking cost ~0.6 s/query on the India test pool. Queries are instead
+   densified in chunks and scored with one sparse(pool)×dense(queries) product
+   on the GPU, followed by an exact two-stage block top-K (~500× faster than
+   CuPy's sort-based argpartition). `max_df=0.05` drops the most common n-grams.
 
-5. **Parallelisation** — `ThreadPoolExecutor` for I/O-bound file loading;
-   `ProcessPoolExecutor` for CPU-bound feature computation. TF-IDF blocking
-   uses thread-level batch parallelism.
+5. **Blocker selection by measurement** — `eval_blocking.py` showed the name
+   prefix / sorted-token / address-number key indexes add ≤0.12% unique recall
+   but 110–145 candidates per entity, pushing the union past the pre-filter
+   cap and lowering final recall (India 98.5% → 88.9%). They are off by default.
+
+6. **Transliteration** — ≥10.8% of Indian true pairs have the name in a
+   different script on each side; transliterating raises char TF-IDF entity
+   recall from 85.5% to 91.2% (India, 5% pool sample).
+
+7. **Parallelisation** — `ThreadPoolExecutor` for I/O-bound file loading;
+   `ProcessPoolExecutor` for CPU-bound feature computation.
 
 ## Output Files
 
