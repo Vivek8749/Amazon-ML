@@ -560,14 +560,22 @@ def generate_all_candidates(s1_df, pool_df, vec, pool_mat, pool_mat_cpu, top_k=T
     n = len(s1_df)
     candidates = {}
 
-    # GPU sparse ops (both spGEMM fast-path and SpMM fallback) should be
-    # serialised to avoid GPU memory contention.  The adaptive strategy inside
-    # tfidf_block_batch handles speed (spGEMM for small pools, SpMM for large).
+    # GPU spGEMM fast-path must be serialised to avoid memory contention.
+    # But if we know the pool is large (>200k) or we're already in CPU fallback
+    # mode, we can safely use all available CPU threads for massive speedups.
     if n_workers is None:
-        n_workers = 1
+        if pool_mat is None or len(pool_df) > 200_000 or getattr(tfidf_block_batch, "_use_cpu_fallback", False):
+            n_workers = min(N_WORKERS, 16)
+            mode = "CPU/Multi-thread"
+        else:
+            n_workers = 1
+            mode = "GPU/Serialised"
+    else:
+        mode = "Custom"
+        
     batch_ranges = [(i, min(i + BATCH_SIZE, n)) for i in range(0, n, BATCH_SIZE)]
     print(f"[Block] {len(batch_ranges)} batches, {n:,} queries, "
-          f"using {min(n_workers, len(batch_ranges))} GPU thread(s)...")
+          f"using {min(n_workers, len(batch_ranges))} thread(s) ({mode})...")
 
     def _process_batch(rng):
         bs, be = rng
