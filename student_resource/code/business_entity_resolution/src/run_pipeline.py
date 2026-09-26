@@ -102,9 +102,9 @@ MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "xgb_model.pkl")
 CACHE_DIR  = os.path.join(BASE_DIR, ".cache")       # parquet cache for preprocessed data
 EMBED_CACHE_DIR = os.path.join(CACHE_DIR, "embeddings")  # .npy cache for HNSW embeddings
 
-TFIDF_TOP_K       = 100             # high blocking recall
+TFIDF_TOP_K       = 30              # precision-focused (was 100; caused candidate explosion)
 TFIDF_MAX_FEATURES= 200_000         # 200K vocab — plenty of RAM
-NEG_POS_RATIO     = 3               # balanced negatives
+NEG_POS_RATIO     = 5               # more negatives → more conservative model (was 3)
 RANDOM_SEED       = 42
 VAL_FRACTION      = 0.1
 BATCH_SIZE        = 2_000           # smaller batches to cap peak RAM
@@ -1194,37 +1194,39 @@ def compute_pair_features(n1, a1, n2, a2):
         1.0 - Levenshtein.normalized_distance(c1, c2) if (c1.strip() and c2.strip()) else (1.0 if not c1.strip() and not c2.strip() else 0.0),
     ]
 
-    # ---- phonetic features (8) ----
-    sx1, sx2 = _soundex(n1), _soundex(n2)
-    mp1, mp2 = _metaphone(n1), _metaphone(n2)
-    ny1, ny2 = _nysiis(n1), _nysiis(n2)
-    sxa1, sxa2 = _soundex_all_tokens(n1), _soundex_all_tokens(n2)
-    pin1, pin2 = _extract_pin_codes(a1), _extract_pin_codes(a2)
-    city1, city2 = _extract_city_tokens(a1), _extract_city_tokens(a2)
+    # ---- phonetic features (8) — ONLY included when jellyfish is installed ----
+    if _PHONETIC_OK:
+        sx1, sx2 = _soundex(n1), _soundex(n2)
+        mp1, mp2 = _metaphone(n1), _metaphone(n2)
+        ny1, ny2 = _nysiis(n1), _nysiis(n2)
+        sxa1, sxa2 = _soundex_all_tokens(n1), _soundex_all_tokens(n2)
+        pin1, pin2 = _extract_pin_codes(a1), _extract_pin_codes(a2)
+        city1, city2 = _extract_city_tokens(a1), _extract_city_tokens(a2)
 
-    feats.extend([
-        # Soundex exact match on first word
-        1.0 if (sx1 and sx2 and sx1 == sx2) else 0.0,
-        # Metaphone exact match on first word
-        1.0 if (mp1 and mp2 and mp1 == mp2) else 0.0,
-        # Soundex Jaro-Winkler (phonetic fuzzy match)
-        JaroWinkler.similarity(sx1, sx2) if (sx1 and sx2) else 0.0,
-        # NYSIIS match on first word
-        1.0 if (ny1 and ny2 and ny1 == ny2) else 0.0,
-        # Soundex Jaccard across all name tokens
-        _jac(sxa1, sxa2),
-        # PIN/ZIP code exact match
-        1.0 if (pin1 and pin2 and pin1 & pin2) else (1.0 if not pin1 and not pin2 else 0.0),
-        # City token overlap
-        _ovl(city1, city2),
-        # Address numeric token count match (same number of numbers = structural similarity)
-        1.0 if len(an1) == len(an2) else 1.0 / (1.0 + abs(len(an1) - len(an2))),
-    ])
+        feats.extend([
+            # Soundex exact match on first word
+            1.0 if (sx1 and sx2 and sx1 == sx2) else 0.0,
+            # Metaphone exact match on first word
+            1.0 if (mp1 and mp2 and mp1 == mp2) else 0.0,
+            # Soundex Jaro-Winkler (phonetic fuzzy match)
+            JaroWinkler.similarity(sx1, sx2) if (sx1 and sx2) else 0.0,
+            # NYSIIS match on first word
+            1.0 if (ny1 and ny2 and ny1 == ny2) else 0.0,
+            # Soundex Jaccard across all name tokens
+            _jac(sxa1, sxa2),
+            # PIN/ZIP code exact match
+            1.0 if (pin1 and pin2 and pin1 & pin2) else (1.0 if not pin1 and not pin2 else 0.0),
+            # City token overlap
+            _ovl(city1, city2),
+            # Address numeric token count match (same number of numbers = structural similarity)
+            1.0 if len(an1) == len(an2) else 1.0 / (1.0 + abs(len(an1) - len(an2))),
+        ])
 
     return feats
 
-N_FEATURES = 48
-FEATURE_NAMES = [
+# Feature count is DYNAMIC: 40 base features + 8 phonetic features if jellyfish installed
+N_FEATURES = 48 if _PHONETIC_OK else 40
+_BASE_FEATURE_NAMES = [
     "name_lev","name_jw","name_tsort","name_tset","name_partial","name_ratio",
     "name_jac","name_ovl","name_dice","name_cont12","name_cont21",
     "name_first","name_lr",
@@ -1235,11 +1237,13 @@ FEATURE_NAMES = [
     "addr_nonum_jac","addr_contain",
     "anum_jac","anum_ovl","anum_match12","anum_first","anum_cnt_diff",
     "comb_tsort","comb_tset","comb_jac","name_tok_diff","comb_lev",
-    # phonetic (8)
+]
+_PHONETIC_FEATURE_NAMES = [
     "phon_soundex_match","phon_metaphone_match","phon_soundex_jw",
     "phon_nysiis_match","phon_soundex_jac",
     "addr_pin_match","addr_city_ovl","addr_num_cnt_match",
 ]
+FEATURE_NAMES = _BASE_FEATURE_NAMES + (_PHONETIC_FEATURE_NAMES if _PHONETIC_OK else [])
 
 
 # ---- parallel feature workers ------------------------------------------------
@@ -1845,9 +1849,9 @@ def run_train(sample_size):
                          size=min(sample_size, len(s1_full)), replace=False)
         s1s = s1_full[s1_full["entity_id"].isin(set(ids))].copy()
         gts = gt_full[gt_full["source1_entity_id"].isin(set(ids))].copy()
-        extra = 100_000  # 100K extra/country — larger pool for better coverage
-        # Pool size = must_haves + 100K × n_countries ≈ 300-500K records
-        # At 500K pool: 2 threads × 500 queries × 500K × 4B = ~2GB
+        extra = min(max(sample_size * 3, 20_000), 30_000)  # cap at 30K/country to avoid OOM
+        # Pool size = must_haves + 30K × n_countries ≈ 100-150K records max
+        # At 150K pool: 2 threads × 500 queries × 150K × 4B = ~600MB ✔
     countries = set(s1s["country_norm"].unique())
     del s1_full, gt_full; gc.collect()
 
@@ -1923,10 +1927,17 @@ def run_train(sample_size):
     f_score_r1 = evaluate(va_matches_r1, gt_va)
     print(f"\n  ROUND 1 Val F_0.5 = {f_score_r1:.4f}")
 
-    # ---- 9. Hard negative mining → Round 2 ----
-    X_r2, y_r2 = hard_negative_mining(
-        model_r1, s1_tr, pool, gt_tr, tr_cands,
-    )
+    # ---- 9. Hard negative mining → Round 2 (only with enough data) ----
+    # Gate: hard neg mining needs enough entities to produce meaningful hard
+    # negatives. With tiny samples (<10K), there are too few FPs to mine,
+    # and the retrained model overfits to noise.
+    if sample_size >= 10_000:
+        X_r2, y_r2 = hard_negative_mining(
+            model_r1, s1_tr, pool, gt_tr, tr_cands,
+        )
+    else:
+        print(f"[HardNeg] Skipped — sample_size={sample_size:,} < 10K minimum")
+        X_r2, y_r2 = None, None
 
     if X_r2 is not None and len(X_r2) > 0:
         model_r2 = train_xgb(X_r2, y_r2, X_va, y_va, grid_search=False)
@@ -2085,7 +2096,7 @@ def main():
           f"Cache: {CACHE_DIR}")
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["train","full","predict"], default="train")
-    parser.add_argument("--sample-size", type=int, default=100_000)
+    parser.add_argument("--sample-size", type=int, default=20_000)
     parser.add_argument("--clear-cache", action="store_true",
                         help="Delete all cached .parquet files before running")
     args = parser.parse_args()
