@@ -408,7 +408,8 @@ def build_tfidf_blocker(pool_df: pd.DataFrame):
         return hasher.transform(chunk)
         
     print(f"[Block] Hashing {len(texts):,} records in {len(chunks)} chunks across {min(N_WORKERS, 16)} workers...")
-    with ProcessPoolExecutor(max_workers=min(N_WORKERS, 16)) as pool:
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(N_WORKERS, 16)) as pool:
         mats = list(pool.map(_hash_chunk, chunks))
         
     pool_mat_cpu = sp.vstack(mats)
