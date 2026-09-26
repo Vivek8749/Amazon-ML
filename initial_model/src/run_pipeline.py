@@ -398,9 +398,15 @@ def build_tfidf_blocker(pool_df: pd.DataFrame):
     pool_mat_cpu = vec.fit_transform(pool_df["combined"].values)
     pool_mat_cpu.indptr = pool_mat_cpu.indptr.astype(np.int32)
     pool_mat_cpu.indices = pool_mat_cpu.indices.astype(np.int32)
-    pool_mat = csp.csr_matrix(pool_mat_cpu)
-    print(f"[Block] GPU matrix {pool_mat.shape} in {time.time()-t0:.1f}s")
-    return vec, pool_mat
+    
+    try:
+        pool_mat = csp.csr_matrix(pool_mat_cpu)
+    except Exception as e:
+        print(f"[Block] GPU pool_mat creation failed: {e}. Proceeding with CPU-only.")
+        pool_mat = None
+        
+    print(f"[Block] Matrix {pool_mat_cpu.shape} in {time.time()-t0:.1f}s")
+    return vec, pool_mat, pool_mat_cpu
 
 
 def _tfidf_query_chunk(args):
@@ -442,26 +448,26 @@ def _tfidf_query_chunk(args):
     return results
 
 
-def tfidf_block_batch(q_texts, q_countries, vec, pool_mat,
+def tfidf_block_batch(q_texts, q_countries, vec, pool_mat, pool_mat_cpu,
                       pool_ids, pool_countries, top_k=TFIDF_TOP_K):
-    """TF-IDF blocking with adaptive GPU strategy.
+    """TF-IDF blocking with adaptive strategy.
 
-    Tries fast spGEMM (sparse × sparse) first.  If the pool matrix is too
+    Tries fast GPU spGEMM (sparse × sparse) first.  If the pool matrix is too
     large and cusparse raises INSUFFICIENT_RESOURCES or OOM, permanently
-    switches to SpMM (sparse × dense) for the rest of the call.  This keeps
-    training speed unchanged (small pool → spGEMM) while large test pools
-    fall back gracefully.
+    switches to CPU scipy.sparse for the rest of the call.  CPU sparse×sparse
+    is much faster than GPU SpMM (sparse×dense) for large pools because the
+    output remains sparse (MBs vs GBs of data).
     """
     q_mat_cpu = vec.transform(q_texts)
     results = []
     chunk_size = 200
     n_queries = q_mat_cpu.shape[0]
-    use_spmm = getattr(tfidf_block_batch, "_use_spmm", False)
+    use_cpu_fallback = getattr(tfidf_block_batch, "_use_cpu_fallback", False) or pool_mat is None
 
     for start in range(0, n_queries, chunk_size):
         end = min(start + chunk_size, n_queries)
 
-        if not use_spmm:
+        if not use_cpu_fallback:
             # ---- Fast path: spGEMM (sparse × sparse → sparse output) ----
             try:
                 q_gpu = csp.csr_matrix(q_mat_cpu[start:end])
@@ -489,29 +495,26 @@ def tfidf_block_batch(q_texts, q_countries, vec, pool_mat,
             except (cp.cuda.memory.OutOfMemoryError, Exception) as exc:
                 exc_str = f"{type(exc).__name__}: {exc}"
                 if "INSUFFICIENT_RESOURCES" in exc_str or "OutOfMemory" in exc_str:
-                    print(f"[Block] spGEMM failed ({type(exc).__name__}), "
-                          f"switching to SpMM fallback for remaining chunks")
-                    use_spmm = True
-                    tfidf_block_batch._use_spmm = True  # persist across calls
+                    print(f"[Block] GPU spGEMM failed ({type(exc).__name__}), "
+                          f"switching to CPU scipy.sparse fallback")
+                    use_cpu_fallback = True
+                    tfidf_block_batch._use_cpu_fallback = True  # persist across calls
                     cp.get_default_memory_pool().free_all_blocks()
-                    # Fall through to SpMM for this chunk
+                    # Fall through to CPU for this chunk
                 else:
                     raise
 
-        # ---- Fallback: SpMM (sparse × dense → dense output) ----
-        q_dense = cp.array(q_mat_cpu[start:end].toarray(), dtype=cp.float32)
-        sub_sim = cp.asnumpy(pool_mat.dot(q_dense.T).T)
-        del q_dense
-        cp.get_default_memory_pool().free_all_blocks()
+        # ---- Fallback: CPU scipy.sparse (sparse × sparse → sparse output) ----
+        q_cpu = q_mat_cpu[start:end]
+        sub_sim = q_cpu.dot(pool_mat_cpu.T)
 
         for local_i in range(end - start):
             global_i = start + local_i
-            row = sub_sim[local_i]
-            nz = np.nonzero(row)[0]
-            if len(nz) == 0:
+            row = sub_sim.getrow(local_i)
+            if row.nnz == 0:
                 results.append([])
                 continue
-            idx, dat = nz, row[nz]
+            idx, dat = row.indices, row.data
             mask = pool_countries[idx] == q_countries[global_i]
             fi, fd = idx[mask], dat[mask]
             if len(fd) == 0:
@@ -522,11 +525,10 @@ def tfidf_block_batch(q_texts, q_countries, vec, pool_mat,
                 results.append(pool_ids[fi[top]].tolist())
             else:
                 results.append(pool_ids[fi].tolist())
-        del sub_sim
+        # (sub_sim automatically garbage collected)
     return results
 
-
-def generate_all_candidates(s1_df, pool_df, vec, pool_mat, top_k=TFIDF_TOP_K, n_workers=None):
+def generate_all_candidates(s1_df, pool_df, vec, pool_mat, pool_mat_cpu, top_k=TFIDF_TOP_K, n_workers=None):
     """Multi-strategy blocking with TF-IDF + name-key + addr-num indexes."""
     pool_ids       = pool_df["entity_id"].values
     pool_countries = pool_df["country_norm"].values
@@ -571,7 +573,7 @@ def generate_all_candidates(s1_df, pool_df, vec, pool_mat, top_k=TFIDF_TOP_K, n_
         bs, be = rng
         cands = tfidf_block_batch(
             s1_texts[bs:be], s1_countries[bs:be],
-            vec, pool_mat, pool_ids, pool_countries, top_k,
+            vec, pool_mat, pool_mat_cpu, pool_ids, pool_countries, top_k,
         )
         return bs, be, cands
 
@@ -1084,15 +1086,15 @@ def run_train(sample_size):
     # ---- 6. Blocking ----
     stage6 = _load_ckpt("stage6_blocking")
     if stage6 is not None:
-        vec, pmat, tr_cands, va_cands = (
-            stage6["vec"], stage6["pmat"], stage6["tr_cands"], stage6["va_cands"],
+        vec, pmat, pmat_cpu, tr_cands, va_cands = (
+            stage6["vec"], stage6["pmat"], stage6["pmat_cpu"], stage6["tr_cands"], stage6["va_cands"],
         )
     else:
-        vec, pmat = build_tfidf_blocker(pool)
-        tr_cands  = generate_all_candidates(s1_tr, pool, vec, pmat)
-        va_cands  = generate_all_candidates(s1_va, pool, vec, pmat)
+        vec, pmat, pmat_cpu = build_tfidf_blocker(pool)
+        tr_cands  = generate_all_candidates(s1_tr, pool, vec, pmat, pmat_cpu)
+        va_cands  = generate_all_candidates(s1_va, pool, vec, pmat, pmat_cpu)
         _save_ckpt("stage6_blocking", {
-            "vec": vec, "pmat": pmat, "tr_cands": tr_cands, "va_cands": va_cands,
+            "vec": vec, "pmat": pmat, "pmat_cpu": pmat_cpu, "tr_cands": tr_cands, "va_cands": va_cands,
         })
 
     # Blocking recall
@@ -1223,8 +1225,8 @@ def _predict_test_by_country(model, threshold):
                 country_candidates[sid] = []
         else:
             # Block
-            vec, pmat = build_tfidf_blocker(pool_co)
-            cands = generate_all_candidates(s1_co, pool_co, vec, pmat)
+            vec, pmat, pmat_cpu = build_tfidf_blocker(pool_co)
+            cands = generate_all_candidates(s1_co, pool_co, vec, pmat, pmat_cpu)
 
             # Predict
             matches = predict_all(model, s1_co, pool_co, cands, threshold)
