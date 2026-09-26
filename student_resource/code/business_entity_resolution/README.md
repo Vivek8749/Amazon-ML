@@ -45,16 +45,16 @@ run_pipeline.py (standalone, self-contained entry point)
 
 The `src/` directory also contains a modular version of the pipeline:
 
-| File | Purpose |
-|---|---|
-| `config.py` | Centralised configuration constants |
+| File               | Purpose                                                 |
+| ------------------ | ------------------------------------------------------- |
+| `config.py`        | Centralised configuration constants                     |
 | `preprocessing.py` | Text normalisation with legal suffixes, address abbrevs |
-| `blocking.py` | `TFIDFBlocker` class + supplementary index generation |
-| `features.py` | 33 similarity features via `compute_features()` |
-| `matcher.py` | XGBoost train/predict with threshold optimisation |
-| `evaluation.py` | Macro-averaged F₀.₅ scoring |
-| `io_utils.py` | TSV output formatting |
-| `pipeline.py` | Orchestration (train/full/predict modes) |
+| `blocking.py`      | `TFIDFBlocker` class + supplementary index generation   |
+| `features.py`      | 33 similarity features via `compute_features()`         |
+| `matcher.py`       | XGBoost train/predict with threshold optimisation       |
+| `evaluation.py`    | Macro-averaged F₀.₅ scoring                             |
+| `io_utils.py`      | TSV output formatting                                   |
+| `pipeline.py`      | Orchestration (train/full/predict modes)                |
 
 ## Requirements
 
@@ -69,6 +69,7 @@ scipy>=1.10.0
 ```
 
 Install:
+
 ```bash
 pip install -r requirements.txt
 ```
@@ -91,6 +92,7 @@ python code/business_entity_resolution/src/run_pipeline.py --mode full --sample-
 ```
 
 This will:
+
 1. Load training data (S1 + sampled S2/S3 pool)
 2. Split into train/validation (90/10)
 3. Build TF-IDF blocker and generate candidate pairs
