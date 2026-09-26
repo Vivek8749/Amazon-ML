@@ -41,7 +41,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # ===== CONFIGURATION ==========================================================
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 TRAIN_S1 = os.path.join(BASE_DIR, "student_resource", "dataset", "train", "train_source1.tsv")
 TRAIN_S2 = os.path.join(BASE_DIR, "student_resource", "dataset", "train", "train_source2.tsv")
 TRAIN_S3 = os.path.join(BASE_DIR, "student_resource", "dataset", "train", "train_source3.tsv")
