@@ -22,12 +22,27 @@ import re
 import pickle
 import warnings
 import multiprocessing as mp
+import importlib.util
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from functools import partial
 
 import numpy as np
 import pandas as pd
+# NVIDIA's pip wheels keep NVRTC under site-packages/nvidia/.../lib rather than
+# the system loader path. Add that directory before CuPy initializes.
+try:
+    _nvrtc_spec = importlib.util.find_spec("nvidia.cuda_nvrtc")
+except (ImportError, ModuleNotFoundError):
+    _nvrtc_spec = None
+if _nvrtc_spec and _nvrtc_spec.origin:
+    _nvrtc_lib = os.path.join(os.path.dirname(_nvrtc_spec.origin), "lib")
+    if os.path.isdir(_nvrtc_lib):
+        _loader_path = os.environ.get("LD_LIBRARY_PATH", "")
+        if _nvrtc_lib not in _loader_path.split(os.pathsep):
+            os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(
+                part for part in (_nvrtc_lib, _loader_path) if part
+            )
 try:
     import cupy as cp
     import cupyx.scipy.sparse as csp

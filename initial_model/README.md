@@ -7,6 +7,9 @@ the dependencies from this directory:
 python -m pip install -r requirements.txt
 ```
 
+On hosted GPU environments such as Lightning AI, restart the kernel after
+installing so `libnvrtc.so.12` is visible to CuPy.
+
 Run the standalone pipeline from `initial_model/`:
 
 ```bash

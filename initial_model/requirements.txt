@@ -8,3 +8,6 @@ scipy>=1.10.0
 pyarrow>=12.0.0
 # CUDA 12.x runtime for GPU sparse TF-IDF and CUDA-enabled XGBoost.
 cupy-cuda12x>=13.0.0
+# CuPyX sparse kernels require NVRTC; hosted GPU images may not preinstall it.
+nvidia-cuda-nvrtc-cu12>=12.0.0
+nvidia-cuda-runtime-cu12>=12.0.0
