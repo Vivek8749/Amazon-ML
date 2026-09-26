@@ -4,7 +4,7 @@ Scalable Entity Resolution Pipeline ΓÇö Parallelised with Workers & Threads.
 
 Key parallelism:
  - ThreadPoolExecutor for concurrent I/O (loading 3 source files in parallel)
- - ProcessPoolExecutor for CPU-heavy work (feature engineering, blocking scoring)
+ - ProcessPoolExecutor for host-side string feature construction
  - Vectorised pandas ops (no row-by-row apply)
  - Batched sparse-matrix operations
 
@@ -28,7 +28,13 @@ from functools import partial
 
 import numpy as np
 import pandas as pd
-from scipy.sparse import csr_matrix
+try:
+    import cupy as cp
+    import cupyx.scipy.sparse as csp
+except Exception as exc:
+    raise RuntimeError(
+        "The initial model requires CuPy. Install initial_model/requirements.txt."
+    ) from exc
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import precision_recall_curve
 from xgboost import XGBClassifier
@@ -40,6 +46,20 @@ import hashlib
 warnings.filterwarnings("ignore")
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+# CUDA is a hard requirement for the initial model. Do this check before any
+# data is loaded so a CPU-only environment cannot silently run a slower path.
+try:
+    if not cp.cuda.is_available():
+        raise RuntimeError("no CUDA device is available")
+    CUDA_DEVICE = cp.cuda.Device()
+    print(f"[GPU] CUDA device: {CUDA_DEVICE.name}")
+except Exception as exc:
+    raise RuntimeError(
+        "The initial model requires an NVIDIA GPU and a working CUDA runtime. "
+        "Install the dependencies in initial_model/requirements.txt and check "
+        "the NVIDIA driver."
+    ) from exc
 
 # ===== CONFIGURATION ==========================================================
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -273,11 +293,13 @@ def build_tfidf_blocker(pool_df: pd.DataFrame):
         analyzer="char_wb", ngram_range=(2, 4),
         max_features=TFIDF_MAX_FEATURES, sublinear_tf=True, dtype=np.float32,
     )
-    pool_mat = vec.fit_transform(pool_df["combined"].values)
-    # Ensure int32 indices to save memory (scipy default can be int64 on large data)
-    pool_mat.indptr  = pool_mat.indptr.astype(np.int32)
-    pool_mat.indices = pool_mat.indices.astype(np.int32)
-    print(f"[Block] Matrix {pool_mat.shape} in {time.time()-t0:.1f}s")
+    # sklearn still provides the vocabulary/TF-IDF transform, but all sparse
+    # similarity products are performed by CuPy on the selected CUDA device.
+    pool_mat_cpu = vec.fit_transform(pool_df["combined"].values)
+    pool_mat_cpu.indptr = pool_mat_cpu.indptr.astype(np.int32)
+    pool_mat_cpu.indices = pool_mat_cpu.indices.astype(np.int32)
+    pool_mat = csp.csr_matrix(pool_mat_cpu)
+    print(f"[Block] GPU matrix {pool_mat.shape} in {time.time()-t0:.1f}s")
     return vec, pool_mat
 
 
@@ -290,15 +312,15 @@ def _tfidf_query_chunk(args):
         pool_mat = pickle.load(f)
 
     q_mat = vec.transform(q_texts)
-    scores = q_mat.dot(pool_mat.T)
+    scores = csp.csr_matrix(q_mat).dot(pool_mat.T)
     results = []
     for i in range(scores.shape[0]):
         row = scores.getrow(i)
         if row.nnz == 0:
             results.append([])
             continue
-        idx = row.indices
-        dat = row.data
+        idx = cp.asnumpy(row.indices)
+        dat = cp.asnumpy(row.data)
         mask = pool_countries[idx] == q_countries[i]
         fi, fd = idx[mask], dat[mask]
         if len(fd) == 0:
@@ -322,7 +344,7 @@ def tfidf_block_batch(q_texts, q_countries, vec, pool_mat,
 
     for start in range(0, n_queries, chunk_size):
         end = min(start + chunk_size, n_queries)
-        sub_sim = q_mat[start:end].dot(pool_mat.T)  # shape (chunk_size, pool_size)
+        sub_sim = csp.csr_matrix(q_mat[start:end]).dot(pool_mat.T)
         
         for local_i in range(end - start):
             global_i = start + local_i
@@ -330,7 +352,7 @@ def tfidf_block_batch(q_texts, q_countries, vec, pool_mat,
             if row.nnz == 0:
                 results.append([])
                 continue
-            idx, dat = row.indices, row.data
+            idx, dat = cp.asnumpy(row.indices), cp.asnumpy(row.data)
             mask = pool_countries[idx] == q_countries[global_i]
             fi, fd = idx[mask], dat[mask]
             if len(fd) == 0:
@@ -376,8 +398,7 @@ def generate_all_candidates(s1_df, pool_df, vec, pool_mat, top_k=TFIDF_TOP_K, n_
     n = len(s1_df)
     candidates = {}
 
-    # We use ThreadPoolExecutor for batch-level concurrency on TF-IDF queries
-    # (each batch involves scipy sparse ops that release the GIL internally)
+    # We use ThreadPoolExecutor for batch-level concurrency on GPU TF-IDF queries.
     if n_workers is None:
         n_workers = N_WORKERS
     batch_ranges = [(i, min(i + BATCH_SIZE, n)) for i in range(0, n, BATCH_SIZE)]

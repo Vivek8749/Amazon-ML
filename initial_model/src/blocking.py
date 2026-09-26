@@ -12,7 +12,8 @@ import os
 import pickle
 import numpy as np
 import pandas as pd
-from scipy.sparse import vstack, csr_matrix
+import cupy as cp
+import cupyx.scipy.sparse as csp
 from sklearn.feature_extraction.text import TfidfVectorizer
 from tqdm import tqdm
 
@@ -21,6 +22,11 @@ from .config import (
     TFIDF_TOP_K, TFIDF_NGRAM_RANGE, TFIDF_MAX_FEATURES,
     BATCH_SIZE, MODEL_DIR,
 )
+
+if not cp.cuda.is_available():
+    raise RuntimeError(
+        "The initial-model TF-IDF blocker requires an NVIDIA GPU with CUDA."
+    )
 
 
 def _safe_str(val) -> str:
@@ -83,6 +89,7 @@ class TFIDFBlocker:
             dtype=np.float32,
         )
         self.pool_matrix = None
+        self.pool_matrix_gpu = None
         self.pool_ids = None
         self.pool_countries = None
 
@@ -94,7 +101,8 @@ class TFIDFBlocker:
 
         texts = pool_df["combined"].values
         self.pool_matrix = self.vectoriser.fit_transform(texts)
-        print(f"[TFIDFBlocker] Pool matrix shape: {self.pool_matrix.shape}")
+        self.pool_matrix_gpu = csp.csr_matrix(self.pool_matrix)
+        print(f"[TFIDFBlocker] GPU pool matrix shape: {self.pool_matrix.shape}")
         return self
 
     def query_batch(self, query_texts: np.ndarray, query_countries: np.ndarray) -> list:
@@ -104,27 +112,30 @@ class TFIDFBlocker:
         """
         query_matrix = self.vectoriser.transform(query_texts)
         # Compute cosine similarity (both are L2-normalised by TF-IDF)
-        scores = query_matrix.dot(self.pool_matrix.T)
+        scores = csp.csr_matrix(query_matrix).dot(self.pool_matrix_gpu.T)
 
         results = []
         for i in range(scores.shape[0]):
             row = scores[i]
-            if hasattr(row, "toarray"):
-                row = row.toarray().ravel()
-            else:
-                row = np.asarray(row).ravel()
+            # Transfer only non-zero scores back to the host; materialising a
+            # dense pool-sized row would defeat the GPU/memory optimisation.
+            if row.nnz == 0:
+                results.append([])
+                continue
+            idx = cp.asnumpy(row.indices)
+            dat = cp.asnumpy(row.data)
 
-            # Country filter
+            # Country filter on the sparse non-zero entries only.
             country = query_countries[i]
-            country_mask = (self.pool_countries == country)
-            row[~country_mask] = 0.0
+            country_mask = self.pool_countries[idx] == country
+            idx, dat = idx[country_mask], dat[country_mask]
 
             # Top-K
-            if self.top_k < len(row):
-                top_idx = np.argpartition(row, -self.top_k)[-self.top_k:]
-                top_idx = top_idx[row[top_idx] > 0]
+            if self.top_k < len(dat):
+                top = np.argpartition(dat, -self.top_k)[-self.top_k:]
+                top_idx = idx[top][dat[top] > 0]
             else:
-                top_idx = np.where(row > 0)[0]
+                top_idx = idx[dat > 0]
 
             candidates = self.pool_ids[top_idx].tolist()
             results.append(candidates)
@@ -134,6 +145,17 @@ class TFIDFBlocker:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "wb") as f:
             pickle.dump(self, f)
+
+    def __getstate__(self):
+        """Do not pickle device memory; rebuild it after loading."""
+        state = self.__dict__.copy()
+        state["pool_matrix_gpu"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if self.pool_matrix is not None:
+            self.pool_matrix_gpu = csp.csr_matrix(self.pool_matrix)
 
     @staticmethod
     def load(path: str) -> "TFIDFBlocker":

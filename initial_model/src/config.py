@@ -3,6 +3,8 @@ Configuration constants for the Entity Resolution pipeline.
 """
 import os
 
+GPU_DEVICE = "cuda"
+
 # ΓöÇΓöÇΓöÇ paths ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -50,6 +52,7 @@ XGB_PARAMS = {
     "n_jobs": -1,
     "random_state": RANDOM_SEED,
     "tree_method": "hist",
+    "device": GPU_DEVICE,
 }
 
 # Threshold for final matching (optimized during validation)

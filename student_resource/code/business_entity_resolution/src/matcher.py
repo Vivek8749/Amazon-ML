@@ -122,6 +122,7 @@ def train_model(X_train, y_train, X_val=None, y_val=None) -> XGBClassifier:
 
     params = dict(XGB_PARAMS)
     params["scale_pos_weight"] = scale_pos_weight
+    params["device"] = "cuda"
 
     model = XGBClassifier(**params)
 

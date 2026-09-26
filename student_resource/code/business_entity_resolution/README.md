@@ -73,6 +73,13 @@ Install:
 pip install -r requirements.txt
 ```
 
+The pipeline requires an NVIDIA GPU with a working CUDA driver and fails at
+startup when CUDA is unavailable. XGBoost and sentence-transformers use CUDA
+explicitly, and CuPy provides GPU sparse-matrix operations. Pandas, text
+normalisation, RapidFuzz, and HNSW index construction still use CPU-backed
+libraries; moving those stages to GPU requires replacing them with
+RAPIDS/cuDF/cuML-compatible implementations.
+
 ## How to Reproduce
 
 All commands should be run from the `student_resource/` directory.

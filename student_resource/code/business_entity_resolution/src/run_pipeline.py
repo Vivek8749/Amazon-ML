@@ -72,17 +72,22 @@ if _PHONETIC_OK:
 else:
     print("[Phonetic] Not available (pip install jellyfish) — phonetic features disabled")
 
-# ---- GPU (CuPy) with graceful CPU fallback -----------------------------------
+# ---- GPU (CuPy) --------------------------------------------------------------
 try:
     import cupy as cp
     import cupyx.scipy.sparse as csp
     _GPU_OK = cp.cuda.is_available()
-except Exception:
-    _GPU_OK = False
-if _GPU_OK:
-    print("[GPU] CuPy detected — TF-IDF matmul will run on GPU")
-else:
-    print("[GPU] CuPy not available — running TF-IDF matmul on CPU")
+except Exception as exc:
+    raise RuntimeError(
+        "CUDA is required. Install dependencies from requirements.txt, "
+        "including cupy-cuda12x."
+    ) from exc
+if not _GPU_OK:
+    raise RuntimeError(
+        "CUDA is required but no GPU device is available. "
+        "Check the NVIDIA driver and CUDA installation."
+    )
+print(f"[GPU] CUDA device: {cp.cuda.Device().name}")
 
 warnings.filterwarnings("ignore")
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -551,7 +556,7 @@ def _load_sbert_model():
         return None
     print(f"[HNSW] Loading model: {HNSW_MODEL_NAME}...")
     t0 = time.time()
-    model = SentenceTransformer(HNSW_MODEL_NAME)
+    model = SentenceTransformer(HNSW_MODEL_NAME, device="cuda")
     print(f"[HNSW] Model loaded in {time.time()-t0:.1f}s")
     return model
 
@@ -1405,7 +1410,7 @@ def train_xgb(X_train, y_train, X_val=None, y_val=None, grid_search=True):
         # Single config: use first grid entry
         cfg = XGB_GRID[0]
         params = {**base_params, **cfg}
-        model = XGBClassifier(**params, device="cpu")
+        model = XGBClassifier(**params, device="cuda")
         print(f"[XGB] Training single config: {cfg}")
         model.fit(X_train, y_train, eval_set=[(X_val, y_val)] if X_val is not None else None, verbose=50)
         return model
@@ -1419,7 +1424,7 @@ def train_xgb(X_train, y_train, X_val=None, y_val=None, grid_search=True):
 
     for i, cfg in enumerate(XGB_GRID):
         params = {**base_params, **cfg}
-        model = XGBClassifier(**params, device="cpu")
+        model = XGBClassifier(**params, device="cuda")
         print(f"\n[XGB Grid {i+1}/{len(XGB_GRID)}] {cfg}")
         model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=0)
 

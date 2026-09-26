@@ -10,5 +10,5 @@ sentence-transformers>=2.2.0
 hnswlib>=0.7.0
 datasketch>=1.6.0
 jellyfish>=1.0.0
-# Optional: GPU-accelerated TF-IDF matmul (install cupy-cuda12x or cupy-cuda11x)
-# cupy-cuda12x
+# Required for the CUDA execution path used by the pipeline.
+cupy-cuda12x>=13.0.0
