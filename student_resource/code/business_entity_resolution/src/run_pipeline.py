@@ -38,6 +38,29 @@ from rapidfuzz.distance import Levenshtein, JaroWinkler
 from tqdm import tqdm
 from difflib import SequenceMatcher
 
+# ---- HNSW dense retrieval (sentence-transformers + hnswlib) -------------------
+try:
+    from sentence_transformers import SentenceTransformer
+    import hnswlib
+    _HNSW_OK = True
+except ImportError:
+    _HNSW_OK = False
+if _HNSW_OK:
+    print("[HNSW] sentence-transformers + hnswlib available")
+else:
+    print("[HNSW] Not available (pip install sentence-transformers hnswlib) — skipping dense retrieval")
+
+# ---- MinHash / LSH (datasketch) ----------------------------------------------
+try:
+    from datasketch import MinHash, MinHashLSH
+    _LSH_OK = True
+except ImportError:
+    _LSH_OK = False
+if _LSH_OK:
+    print("[LSH] datasketch available")
+else:
+    print("[LSH] Not available (pip install datasketch) — skipping MinHash/LSH")
+
 # ---- GPU (CuPy) with graceful CPU fallback -----------------------------------
 try:
     import cupy as cp
@@ -79,6 +102,23 @@ BLOCK_THREADS     = 2               # 2 concurrent blocking threads to limit pea
 PRED_BATCH_SIZE   = 500_000         # large CPU predict batch
 WORD_TFIDF_MAX    = 100_000         # bigger word vocab for better recall
 WORD_TFIDF_TOP_K  = 30              # word-level top-K
+
+# ---- HNSW configuration ----
+HNSW_MODEL_NAME   = "paraphrase-multilingual-MiniLM-L12-v2"  # ~420MB, supports en/hi/fr
+HNSW_TOP_K        = 50              # candidates from dense retrieval per query
+HNSW_EF_CONSTRUCT = 200             # construction-time accuracy (higher = slower build, better recall)
+HNSW_EF_SEARCH    = 100             # query-time accuracy (higher = slower query, better recall)
+HNSW_M            = 48              # connections per node (higher = more RAM, better recall)
+HNSW_BATCH_SIZE   = 512             # encode batch size for sentence-transformers
+
+# ---- MinHash/LSH configuration ----
+LSH_NUM_PERM      = 128             # number of permutations (higher = slower but more accurate)
+LSH_THRESHOLD     = 0.3             # Jaccard similarity threshold for LSH
+LSH_NGRAM_SIZE    = 3               # character n-gram size for MinHash shingling
+
+# ---- Pre-filter configuration ----
+PREFILTER_MAX_CANDIDATES = 200      # max candidates per entity after pre-filter
+PREFILTER_MIN_SCORE      = 0.15     # minimum quick-score to keep a candidate
 
 # config print moved to main() to avoid worker spam
 
@@ -440,9 +480,309 @@ def tfidf_block_batch(q_texts, q_countries, vec, pool_mat,
     return results
 
 
+# ===== HNSW DENSE RETRIEVAL ====================================================
+
+def _load_sbert_model():
+    """Load the sentence-transformer model (cached after first download)."""
+    if not _HNSW_OK:
+        return None
+    print(f"[HNSW] Loading model: {HNSW_MODEL_NAME}...")
+    t0 = time.time()
+    model = SentenceTransformer(HNSW_MODEL_NAME)
+    print(f"[HNSW] Model loaded in {time.time()-t0:.1f}s")
+    return model
+
+
+def _encode_texts(model, texts, batch_size=HNSW_BATCH_SIZE, desc="Encoding"):
+    """Encode texts to dense vectors using sentence-transformers."""
+    print(f"[HNSW] Encoding {len(texts):,} texts...")
+    t0 = time.time()
+    embeddings = model.encode(
+        texts.tolist() if hasattr(texts, 'tolist') else list(texts),
+        batch_size=batch_size,
+        show_progress_bar=True,
+        normalize_embeddings=True,  # L2-normalise for cosine similarity via inner product
+    )
+    print(f"[HNSW] Encoded in {time.time()-t0:.1f}s, shape={embeddings.shape}")
+    return embeddings.astype(np.float32)
+
+
+def build_hnsw_index(pool_df, sbert_model):
+    """Build an HNSW index over the pool (S2+S3) embeddings.
+
+    Returns: (index, pool_ids, pool_countries, sbert_model)
+    """
+    if not _HNSW_OK or sbert_model is None:
+        print("[HNSW] Skipping — not available")
+        return None, None, None, None
+
+    pool_texts = pool_df["combined"].values
+    pool_ids = pool_df["entity_id"].values
+    pool_countries = pool_df["country_norm"].values
+
+    # Encode pool
+    embeddings = _encode_texts(sbert_model, pool_texts, desc="Pool encoding")
+    dim = embeddings.shape[1]
+
+    # Build HNSW index
+    print(f"[HNSW] Building index (dim={dim}, M={HNSW_M}, ef_construct={HNSW_EF_CONSTRUCT})...")
+    t0 = time.time()
+    index = hnswlib.Index(space='ip', dim=dim)  # inner product ≈ cosine (with L2-normed vecs)
+    index.init_index(max_elements=len(embeddings), ef_construction=HNSW_EF_CONSTRUCT, M=HNSW_M)
+    index.add_items(embeddings, np.arange(len(embeddings)))
+    index.set_ef(HNSW_EF_SEARCH)
+    print(f"[HNSW] Index built in {time.time()-t0:.1f}s")
+
+    return index, pool_ids, pool_countries, sbert_model
+
+
+def hnsw_block_batch(query_texts, query_countries, index, pool_ids, pool_countries,
+                     sbert_model, top_k=HNSW_TOP_K):
+    """Query HNSW index for nearest neighbours, with country filtering.
+
+    Args:
+        query_texts: array of combined text strings for S1 entities
+        query_countries: array of country codes for S1 entities
+        index: hnswlib.Index
+        pool_ids: array mapping index position -> entity_id
+        pool_countries: array mapping index position -> country
+        sbert_model: sentence-transformer model for encoding queries
+        top_k: number of candidates per query
+
+    Returns:
+        list of lists of candidate entity_ids (one list per query)
+    """
+    if not _HNSW_OK or index is None or sbert_model is None:
+        return [[] for _ in range(len(query_texts))]
+
+    # Encode queries
+    query_embeddings = _encode_texts(sbert_model, query_texts, desc="Query encoding")
+
+    # Query HNSW — retrieve more than top_k to account for country filtering
+    fetch_k = min(top_k * 3, index.get_current_count())
+    print(f"[HNSW] Querying {len(query_embeddings):,} queries (fetch_k={fetch_k})...")
+    t0 = time.time()
+    labels, distances = index.knn_query(query_embeddings, k=fetch_k)
+    print(f"[HNSW] Query done in {time.time()-t0:.1f}s")
+
+    # Country-filtered results
+    results = []
+    for i in range(len(query_texts)):
+        country = query_countries[i]
+        row_labels = labels[i]
+        # Filter by country, take top_k
+        filtered = []
+        for idx in row_labels:
+            if idx < len(pool_countries) and pool_countries[idx] == country:
+                filtered.append(pool_ids[idx])
+                if len(filtered) >= top_k:
+                    break
+        results.append(filtered)
+
+    return results
+
+
+# ===== MINHASH / LSH ==========================================================
+
+def _text_to_shingles(text, n=LSH_NGRAM_SIZE):
+    """Convert text to a set of character n-gram shingles."""
+    if not text or len(text) < n:
+        return set()
+    return {text[i:i+n] for i in range(len(text) - n + 1)}
+
+
+def _create_minhash(shingles, num_perm=LSH_NUM_PERM):
+    """Create a MinHash signature from a set of shingles."""
+    m = MinHash(num_perm=num_perm)
+    for s in shingles:
+        m.update(s.encode('utf-8'))
+    return m
+
+
+def build_minhash_lsh(pool_df, num_perm=LSH_NUM_PERM, threshold=LSH_THRESHOLD):
+    """Build a MinHash LSH index over the pool (S2+S3).
+
+    Creates separate LSH indexes per country for efficient country-filtered lookup.
+
+    Returns: (lsh_index_dict, key_to_ids_dict)
+        - lsh_index_dict: {country: MinHashLSH}
+        - key_to_ids_dict: {lsh_key: entity_id}
+    """
+    if not _LSH_OK:
+        print("[LSH] Skipping — datasketch not available")
+        return None, None
+
+    print(f"[LSH] Building MinHash LSH (num_perm={num_perm}, threshold={threshold})...")
+    t0 = time.time()
+
+    countries = pool_df["country_norm"].unique()
+    lsh_dict = {}
+    key_to_id = {}
+
+    for country in countries:
+        lsh = MinHashLSH(threshold=threshold, num_perm=num_perm)
+        co_df = pool_df[pool_df["country_norm"] == country]
+
+        for _, row in tqdm(co_df.iterrows(), total=len(co_df),
+                           desc=f"LSH index [{country}]", leave=False):
+            eid = row["entity_id"]
+            text = row.get("combined", "")
+            shingles = _text_to_shingles(text)
+            if not shingles:
+                continue
+            mh = _create_minhash(shingles, num_perm)
+            lsh_key = f"{country}_{eid}"
+            try:
+                lsh.insert(lsh_key, mh)
+                key_to_id[lsh_key] = eid
+            except ValueError:
+                pass  # duplicate key — skip
+
+        lsh_dict[country] = lsh
+
+    print(f"[LSH] Index built in {time.time()-t0:.1f}s "
+          f"({len(key_to_id):,} entries across {len(lsh_dict)} countries)")
+    return lsh_dict, key_to_id
+
+
+def minhash_block_batch(query_texts, query_countries, lsh_dict, key_to_id,
+                        num_perm=LSH_NUM_PERM, max_per_query=100):
+    """Query the MinHash LSH index for approximate Jaccard neighbours.
+
+    Args:
+        query_texts: array of combined text strings
+        query_countries: array of country codes
+        lsh_dict: {country: MinHashLSH}
+        key_to_id: {lsh_key: entity_id}
+        num_perm: number of permutations (must match build)
+        max_per_query: max candidates per query
+
+    Returns:
+        list of lists of candidate entity_ids
+    """
+    if not _LSH_OK or lsh_dict is None:
+        return [[] for _ in range(len(query_texts))]
+
+    results = []
+    for i in range(len(query_texts)):
+        country = query_countries[i]
+        text = query_texts[i]
+        shingles = _text_to_shingles(text)
+
+        if not shingles or country not in lsh_dict:
+            results.append([])
+            continue
+
+        mh = _create_minhash(shingles, num_perm)
+        hits = lsh_dict[country].query(mh)
+
+        # Map LSH keys back to entity_ids
+        cands = []
+        for key in hits[:max_per_query]:
+            if key in key_to_id:
+                cands.append(key_to_id[key])
+        results.append(cands)
+
+    return results
+
+
+# ===== LIGHTWEIGHT PRE-FILTER =================================================
+
+def quick_prefilter(candidates, s1_names, s1_ids,
+                    pool_name_lookup, pool_addr_lookup, s1_addr_lookup,
+                    max_candidates=PREFILTER_MAX_CANDIDATES,
+                    min_score=PREFILTER_MIN_SCORE):
+    """Reduce candidate count per entity using a fast 3-feature score.
+
+    For each (S1, candidate) pair, computes:
+      1. Jaro-Winkler similarity on normalised names (weight 0.45)
+      2. Jaro-Winkler similarity on normalised addresses (weight 0.30)
+      3. Token overlap coefficient on name tokens (weight 0.25)
+
+    Candidates below min_score are dropped. If more than max_candidates remain,
+    only the top-scoring ones are kept. This is ~50x faster than the full
+    40-feature computation because it avoids Levenshtein, partial ratio,
+    SequenceMatcher, and cross-field features.
+
+    Args:
+        candidates: {s1_id: [candidate_ids]}
+        s1_names: array of s1 name_clean values
+        s1_ids: array of s1 entity_ids
+        pool_name_lookup: {entity_id: name_clean}
+        pool_addr_lookup: {entity_id: addr_clean}
+        s1_addr_lookup: {entity_id: addr_clean}
+        max_candidates: maximum candidates to keep per entity
+        min_score: minimum score threshold
+
+    Returns:
+        filtered {s1_id: [candidate_ids]}
+    """
+    s1_name_map = dict(zip(s1_ids, s1_names))
+    filtered = {}
+    total_before = 0
+    total_after = 0
+
+    for s1_id, cands in candidates.items():
+        total_before += len(cands)
+
+        if len(cands) <= max_candidates:
+            filtered[s1_id] = cands
+            total_after += len(cands)
+            continue
+
+        n1 = s1_name_map.get(s1_id, "")
+        a1 = s1_addr_lookup.get(s1_id, "")
+        nt1 = set(n1.split()) if n1 else set()
+
+        scored = []
+        for cid in cands:
+            n2 = pool_name_lookup.get(cid, "")
+            a2 = pool_addr_lookup.get(cid, "")
+
+            # Feature 1: Jaro-Winkler on names
+            if n1 and n2:
+                name_jw = JaroWinkler.similarity(n1, n2)
+            elif not n1 and not n2:
+                name_jw = 1.0
+            else:
+                name_jw = 0.0
+
+            # Feature 2: Jaro-Winkler on addresses
+            if a1 and a2:
+                addr_jw = JaroWinkler.similarity(a1, a2)
+            elif not a1 and not a2:
+                addr_jw = 1.0
+            else:
+                addr_jw = 0.0
+
+            # Feature 3: Token overlap on names
+            nt2 = set(n2.split()) if n2 else set()
+            if nt1 and nt2:
+                token_ovl = len(nt1 & nt2) / min(len(nt1), len(nt2))
+            elif not nt1 and not nt2:
+                token_ovl = 1.0
+            else:
+                token_ovl = 0.0
+
+            score = 0.45 * name_jw + 0.30 * addr_jw + 0.25 * token_ovl
+            if score >= min_score:
+                scored.append((score, cid))
+
+        # Sort descending and take top max_candidates
+        scored.sort(key=lambda x: -x[0])
+        filtered[s1_id] = [cid for _, cid in scored[:max_candidates]]
+        total_after += len(filtered[s1_id])
+
+    return filtered
+
+
 def generate_all_candidates(s1_df, pool_df, vec, pool_mat, top_k=TFIDF_TOP_K,
-                            word_vec=None, word_pmat=None):
-    """Multi-strategy blocking: char TF-IDF + word TF-IDF + name-key + sorted-token-key + addr-num."""
+                            word_vec=None, word_pmat=None,
+                            hnsw_index=None, hnsw_pool_ids=None,
+                            hnsw_pool_countries=None, hnsw_model=None,
+                            lsh_index=None, lsh_key_to_ids=None):
+    """Multi-strategy blocking: char TF-IDF + word TF-IDF + HNSW dense + MinHash/LSH
+    + name-key + sorted-token-key + addr-num, then lightweight pre-filter."""
     pool_ids       = pool_df["entity_id"].values
     pool_countries = pool_df["country_norm"].values
 
@@ -558,6 +898,62 @@ def generate_all_candidates(s1_df, pool_df, vec, pool_mat, top_k=TFIDF_TOP_K,
     total = sum(len(v) for v in candidates.values())
     avg   = total / max(len(candidates), 1)
     print(f"[Block] {total:,} candidates ({avg:.1f}/entity) in {time.time()-t0_block:.1f}s")
+
+    # ---- HNSW dense retrieval pass ----
+    if hnsw_index is not None and hnsw_pool_ids is not None and hnsw_pool_countries is not None:
+        print("[Block] HNSW dense retrieval pass...")
+        th = time.time()
+        hnsw_added = 0
+        hnsw_cands = hnsw_block_batch(
+            s1_texts, s1_countries, hnsw_index, hnsw_pool_ids, hnsw_pool_countries,
+            hnsw_model, top_k=HNSW_TOP_K,
+        )
+        for i, s1_idx in enumerate(range(n)):
+            sid = s1_ids[s1_idx]
+            before = len(candidates.get(sid, []))
+            cset = set(candidates.get(sid, []))
+            cset.update(hnsw_cands[i])
+            candidates[sid] = list(cset)
+            hnsw_added += len(candidates[sid]) - before
+        print(f"[Block] HNSW added {hnsw_added:,} new candidates in {time.time()-th:.1f}s")
+
+    # ---- MinHash/LSH pass ----
+    if lsh_index is not None and lsh_key_to_ids is not None:
+        print("[Block] MinHash/LSH pass...")
+        tl = time.time()
+        lsh_added = 0
+        lsh_cands = minhash_block_batch(
+            s1_texts, s1_countries, lsh_index, lsh_key_to_ids,
+        )
+        for i, s1_idx in enumerate(range(n)):
+            sid = s1_ids[s1_idx]
+            before = len(candidates.get(sid, []))
+            cset = set(candidates.get(sid, []))
+            cset.update(lsh_cands[i])
+            candidates[sid] = list(cset)
+            lsh_added += len(candidates[sid]) - before
+        print(f"[Block] MinHash/LSH added {lsh_added:,} new candidates in {time.time()-tl:.1f}s")
+
+    total = sum(len(v) for v in candidates.values())
+    avg   = total / max(len(candidates), 1)
+    print(f"[Block] TOTAL after all strategies: {total:,} candidates ({avg:.1f}/entity)")
+
+    # ---- Lightweight pre-filter to reduce candidates before 40-feature computation ----
+    print("[Block] Running quick pre-filter...")
+    tp = time.time()
+    candidates = quick_prefilter(
+        candidates, s1_names, s1_ids,
+        dict(zip(pool_df["entity_id"], pool_df["name_clean"])),
+        dict(zip(pool_df["entity_id"], pool_df["addr_clean"])),
+        dict(zip(s1_df["entity_id"], s1_df["addr_clean"])),
+        max_candidates=PREFILTER_MAX_CANDIDATES,
+        min_score=PREFILTER_MIN_SCORE,
+    )
+    total_after = sum(len(v) for v in candidates.values())
+    avg_after   = total_after / max(len(candidates), 1)
+    print(f"[Block] After pre-filter: {total_after:,} candidates ({avg_after:.1f}/entity) "
+          f"[{100*(1 - total_after/max(total,1)):.1f}% reduction] in {time.time()-tp:.1f}s")
+
     gc.collect()   # free TF-IDF intermediates before feature engineering
     return candidates
 
@@ -1059,8 +1455,22 @@ def run_train(sample_size):
     # ---- 6. Blocking ----
     vec, pmat = build_tfidf_blocker(pool)
     word_vec, word_pmat = build_word_tfidf_blocker(pool)
-    tr_cands  = generate_all_candidates(s1_tr, pool, vec, pmat, word_vec=word_vec, word_pmat=word_pmat)
-    va_cands  = generate_all_candidates(s1_va, pool, vec, pmat, word_vec=word_vec, word_pmat=word_pmat)
+
+    # HNSW dense retrieval index
+    sbert_model = _load_sbert_model()
+    hnsw_idx, hnsw_pids, hnsw_pcos, sbert_model = build_hnsw_index(pool, sbert_model)
+
+    # MinHash/LSH index
+    lsh_dict, lsh_key_map = build_minhash_lsh(pool)
+
+    _block_kwargs = dict(
+        word_vec=word_vec, word_pmat=word_pmat,
+        hnsw_index=hnsw_idx, hnsw_pool_ids=hnsw_pids,
+        hnsw_pool_countries=hnsw_pcos, hnsw_model=sbert_model,
+        lsh_index=lsh_dict, lsh_key_to_ids=lsh_key_map,
+    )
+    tr_cands  = generate_all_candidates(s1_tr, pool, vec, pmat, **_block_kwargs)
+    va_cands  = generate_all_candidates(s1_va, pool, vec, pmat, **_block_kwargs)
 
     # Blocking recall
     gt_va_lk = {}
@@ -1154,7 +1564,21 @@ def _predict_test_by_country(model, threshold):
         # Block
         vec, pmat = build_tfidf_blocker(pool_co)
         word_vec, word_pmat = build_word_tfidf_blocker(pool_co)
-        cands = generate_all_candidates(s1_co, pool_co, vec, pmat, word_vec=word_vec, word_pmat=word_pmat)
+
+        # HNSW dense retrieval index (per-country)
+        sbert_model = _load_sbert_model()
+        hnsw_idx, hnsw_pids, hnsw_pcos, sbert_model = build_hnsw_index(pool_co, sbert_model)
+
+        # MinHash/LSH index (per-country)
+        lsh_dict, lsh_key_map = build_minhash_lsh(pool_co)
+
+        cands = generate_all_candidates(
+            s1_co, pool_co, vec, pmat,
+            word_vec=word_vec, word_pmat=word_pmat,
+            hnsw_index=hnsw_idx, hnsw_pool_ids=hnsw_pids,
+            hnsw_pool_countries=hnsw_pcos, hnsw_model=sbert_model,
+            lsh_index=lsh_dict, lsh_key_to_ids=lsh_key_map,
+        )
 
         # Predict
         matches = predict_all(model, s1_co, pool_co, cands, threshold)
@@ -1164,7 +1588,7 @@ def _predict_test_by_country(model, threshold):
             all_matches[sid] = matches.get(sid, [])
             all_candidates[sid] = cands.get(sid, [])
 
-        del pool_co, vec, pmat, cands, matches; gc.collect()
+        del pool_co, vec, pmat, cands, matches, hnsw_idx, sbert_model, lsh_dict; gc.collect()
         print(f"[Test/{country}] Done in {time.time()-tc:.0f}s")
 
     del test_pool_full; gc.collect()
