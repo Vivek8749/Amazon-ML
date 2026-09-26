@@ -436,16 +436,19 @@ def _tfidf_query_chunk(args):
 
 def tfidf_block_batch(q_texts, q_countries, vec, pool_mat,
                       pool_ids, pool_countries, top_k=TFIDF_TOP_K):
-    """TF-IDF blocking ΓÇö row-by-row sparse queries to avoid OOM on large pools."""
+    """TF-IDF blocking — row-by-row sparse queries to avoid OOM on large pools."""
     q_mat = vec.transform(q_texts)
     results = []
-    chunk_size = 200  # mini-batch for fast C++ sparse BLAS without OOM
+    # spGEMM requires large temporary GPU buffers; keep chunks small so a
+    # single matmul doesn't exhaust GPU memory (especially when the pool
+    # matrix has many features).
+    chunk_size = 50
     n_queries = q_mat.shape[0]
 
     for start in range(0, n_queries, chunk_size):
         end = min(start + chunk_size, n_queries)
         sub_sim = csp.csr_matrix(q_mat[start:end]).dot(pool_mat.T)
-        
+
         for local_i in range(end - start):
             global_i = start + local_i
             row = sub_sim.getrow(local_i)
@@ -463,6 +466,9 @@ def tfidf_block_batch(q_texts, q_countries, vec, pool_mat,
                 results.append(pool_ids[fi[top]].tolist())
             else:
                 results.append(pool_ids[fi].tolist())
+        # Release temporary GPU arrays between chunks to prevent OOM.
+        del sub_sim
+        cp.get_default_memory_pool().free_all_blocks()
     return results
 
 
@@ -498,12 +504,15 @@ def generate_all_candidates(s1_df, pool_df, vec, pool_mat, top_k=TFIDF_TOP_K, n_
     n = len(s1_df)
     candidates = {}
 
-    # We use ThreadPoolExecutor for batch-level concurrency on GPU TF-IDF queries.
-    if n_workers is None:
-        n_workers = N_WORKERS
+    # GPU sparse matmul (spGEMM) allocates large temporary buffers; running
+    # multiple batches concurrently from separate threads will quickly exhaust
+    # GPU memory (CUSPARSE_STATUS_INSUFFICIENT_RESOURCES).  Serialize GPU work
+    # with max_workers=1 while still keeping the ThreadPoolExecutor pattern so
+    # the progress bar and candidate-merge logic stay unchanged.
+    gpu_workers = 1
     batch_ranges = [(i, min(i + BATCH_SIZE, n)) for i in range(0, n, BATCH_SIZE)]
     print(f"[Block] {len(batch_ranges)} batches, {n:,} queries, "
-          f"using {min(n_workers, len(batch_ranges))} threads...")
+          f"using {gpu_workers} GPU thread (serialised to avoid spGEMM OOM)...")
 
     def _process_batch(rng):
         bs, be = rng
@@ -514,7 +523,7 @@ def generate_all_candidates(s1_df, pool_df, vec, pool_mat, top_k=TFIDF_TOP_K, n_
         return bs, be, cands
 
     t0 = time.time()
-    with ThreadPoolExecutor(max_workers=min(n_workers, len(batch_ranges))) as pool:
+    with ThreadPoolExecutor(max_workers=gpu_workers) as pool:
         futures = [pool.submit(_process_batch, rng) for rng in batch_ranges]
         for fut in tqdm(as_completed(futures), total=len(futures), desc="TF-IDF blocking"):
             bs, be, cands_batch = fut.result()
