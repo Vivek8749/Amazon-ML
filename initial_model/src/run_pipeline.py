@@ -274,7 +274,7 @@ def tfidf_block_batch(q_texts, q_countries, vec, pool_mat,
     return results
 
 
-def generate_all_candidates(s1_df, pool_df, vec, pool_mat, top_k=TFIDF_TOP_K):
+def generate_all_candidates(s1_df, pool_df, vec, pool_mat, top_k=TFIDF_TOP_K, n_workers=None):
     """Multi-strategy blocking with TF-IDF + name-key + addr-num indexes."""
     pool_ids       = pool_df["entity_id"].values
     pool_countries = pool_df["country_norm"].values
@@ -308,9 +308,11 @@ def generate_all_candidates(s1_df, pool_df, vec, pool_mat, top_k=TFIDF_TOP_K):
 
     # We use ThreadPoolExecutor for batch-level concurrency on TF-IDF queries
     # (each batch involves scipy sparse ops that release the GIL internally)
+    if n_workers is None:
+        n_workers = N_WORKERS
     batch_ranges = [(i, min(i + BATCH_SIZE, n)) for i in range(0, n, BATCH_SIZE)]
     print(f"[Block] {len(batch_ranges)} batches, {n:,} queries, "
-          f"using {min(N_WORKERS, len(batch_ranges))} threads...")
+          f"using {min(n_workers, len(batch_ranges))} threads...")
 
     def _process_batch(rng):
         bs, be = rng
@@ -321,7 +323,7 @@ def generate_all_candidates(s1_df, pool_df, vec, pool_mat, top_k=TFIDF_TOP_K):
         return bs, be, cands
 
     t0 = time.time()
-    with ThreadPoolExecutor(max_workers=min(N_WORKERS, len(batch_ranges))) as pool:
+    with ThreadPoolExecutor(max_workers=min(n_workers, len(batch_ranges))) as pool:
         futures = [pool.submit(_process_batch, rng) for rng in batch_ranges]
         for fut in tqdm(as_completed(futures), total=len(futures), desc="TF-IDF blocking"):
             bs, be, cands_batch = fut.result()
@@ -820,11 +822,16 @@ def _predict_test_by_country(model, threshold):
     """
     Predict on the test set country-by-country to manage memory.
     For each country: load relevant pool subset, block, predict, collect results.
+    Saves per-country checkpoints so a killed run can resume.
     """
     print("\n" + "="*72)
     print(" TEST PREDICTION (country-by-country)")
     print("="*72)
     t0 = time.time()
+
+    # Checkpoint directory
+    ckpt_dir = os.path.join(OUTPUT_DIR, "_checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
 
     # Load S1 test (smallest file)
     ts1 = _load_one_source(TEST_S1)
@@ -834,7 +841,24 @@ def _predict_test_by_country(model, threshold):
     all_matches = {}
     all_candidates = {}
 
+    # Load any previously completed country checkpoints
     for country in countries:
+        ckpt_path = os.path.join(ckpt_dir, f"{country}.pkl")
+        if os.path.exists(ckpt_path):
+            with open(ckpt_path, "rb") as f:
+                saved = pickle.load(f)
+            all_matches.update(saved["matches"])
+            all_candidates.update(saved["candidates"])
+            print(f"[CHECKPOINT] {country.upper()} loaded from cache "
+                  f"({len(saved['matches']):,} entities)")
+
+    for country in countries:
+        # Skip if already checkpointed
+        ckpt_path = os.path.join(ckpt_dir, f"{country}.pkl")
+        if os.path.exists(ckpt_path):
+            print(f"\n--- Skipping country: {country.upper()} (checkpoint exists) ---")
+            continue
+
         print(f"\n--- Processing country: {country.upper()} ---")
         tc = time.time()
         s1_co = ts1[ts1["country_norm"] == country].copy()
@@ -856,28 +880,50 @@ def _predict_test_by_country(model, threshold):
         del pool_frames; gc.collect()
         print(f"[Test/{country}] Pool: {len(pool_co):,}")
 
+        country_matches = {}
+        country_candidates = {}
+
         if len(pool_co) == 0:
             for sid in s1_co["entity_id"].values:
-                all_matches[sid] = []
-                all_candidates[sid] = []
-            continue
+                country_matches[sid] = []
+                country_candidates[sid] = []
+        else:
+            # For large pools (>500K), reduce threads to prevent OOM
+            saved_workers = N_WORKERS
+            if len(pool_co) > 500_000:
+                effective_workers = min(4, N_WORKERS)
+                print(f"[Memory] Large pool ({len(pool_co):,}) — "
+                      f"reducing threads from {N_WORKERS} to {effective_workers}")
+            else:
+                effective_workers = N_WORKERS
 
-        # Block
-        vec, pmat = build_tfidf_blocker(pool_co)
-        cands = generate_all_candidates(s1_co, pool_co, vec, pmat)
+            # Block
+            vec, pmat = build_tfidf_blocker(pool_co)
+            cands = generate_all_candidates(s1_co, pool_co, vec, pmat,
+                                            n_workers=effective_workers)
 
-        # Predict
-        matches = predict_all(model, s1_co, pool_co, cands, threshold)
+            # Predict
+            matches = predict_all(model, s1_co, pool_co, cands, threshold)
 
-        # Collect
-        for sid in s1_co["entity_id"].values:
-            all_matches[sid] = matches.get(sid, [])
-            all_candidates[sid] = cands.get(sid, [])
+            # Collect
+            for sid in s1_co["entity_id"].values:
+                country_matches[sid] = matches.get(sid, [])
+                country_candidates[sid] = cands.get(sid, [])
 
-        del pool_co, vec, pmat, cands, matches; gc.collect()
+            del pool_co, vec, pmat, cands, matches; gc.collect()
+
+        # Save checkpoint for this country
+        with open(ckpt_path, "wb") as f:
+            pickle.dump({"matches": country_matches,
+                         "candidates": country_candidates}, f)
+        print(f"[CHECKPOINT] {country.upper()} saved ({len(country_matches):,} entities)")
+
+        all_matches.update(country_matches)
+        all_candidates.update(country_candidates)
+        del country_matches, country_candidates; gc.collect()
         print(f"[Test/{country}] Done in {time.time()-tc:.0f}s")
 
-    # Write
+    # Write final output
     write_output(all_matches, all_candidates, OUTPUT_DIR)
     print(f"\n[Test] TOTAL TIME: {time.time()-t0:.0f}s")
     return all_matches, all_candidates
