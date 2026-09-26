@@ -15,6 +15,7 @@ from .config import (
 from .data import load_pool_sampled, load_source, parse_ground_truth, write_output
 from .evaluation import evaluate
 from .features import FEATURE_NAMES
+from .preprocessing import PREPROCESS_VERSION
 from .inference import predict_all, singleton_post_process
 from .training import (
     build_training_data, find_best_threshold, hard_negative_mining, train_xgb,
@@ -163,7 +164,9 @@ def run_train(sample_size):
 
     os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
     with open(MODEL_PATH, "wb") as f:
-        pickle.dump({"model": model, "threshold": threshold}, f)
+        pickle.dump({"model": model, "threshold": threshold,
+                     "preprocess_version": PREPROCESS_VERSION,
+                     "feature_names": list(FEATURE_NAMES)}, f)
     print(f"[Model] Saved -> {MODEL_PATH}")
     return model, threshold
 
@@ -249,9 +252,28 @@ def run_full(sample_size=50_000):
     predict_test_by_country(model, threshold)
 
 
-def run_predict():
-    with open(MODEL_PATH, "rb") as f:
+def load_model(path=MODEL_PATH):
+    """Load (model, threshold), refusing a model built for different inputs.
+
+    The pickle records the preprocessing version and feature list it was
+    trained with; a model from before a preprocessing change (e.g. enabling
+    transliteration) would silently score differently-normalised text.
+    """
+    with open(path, "rb") as f:
         d = pickle.load(f)
-    model, threshold = d["model"], d["threshold"]
-    print(f"[Model] loaded, threshold={threshold:.4f}")
+    saved_prep = d.get("preprocess_version")
+    saved_feats = d.get("feature_names")
+    if saved_prep != PREPROCESS_VERSION or saved_feats != list(FEATURE_NAMES):
+        raise RuntimeError(
+            f"Saved model at {path} does not match the current code "
+            f"(preprocessing {saved_prep!r} vs {PREPROCESS_VERSION!r}, "
+            f"features {'match' if saved_feats == list(FEATURE_NAMES) else 'differ'}). "
+            "Retrain with --mode full (or TRAIN_MODEL = True in the notebook)."
+        )
+    print(f"[Model] loaded, threshold={d['threshold']:.4f}")
+    return d["model"], d["threshold"]
+
+
+def run_predict():
+    model, threshold = load_model()
     predict_test_by_country(model, threshold)

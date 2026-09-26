@@ -74,12 +74,13 @@ def write_output(matches, candidates, output_dir):
     os.makedirs(output_dir, exist_ok=True)
     mr = os.path.join(output_dir, "matching_results.tsv")
     cp = os.path.join(output_dir, "candidate_pairs.tsv")
-    with open(mr, "w", encoding="utf-8") as f:
+    # newline="\n": plain LF line endings even on Windows (no stray \r in the last column)
+    with open(mr, "w", encoding="utf-8", newline="\n") as f:
         f.write("source1_entity_id\tmatched_entity_ids\n")
         for sid in tqdm(sorted(matches), desc="Writing matching_results.tsv", unit="row"):
             m = ",".join(sorted(set(matches[sid]))) if matches[sid] else ""
             f.write(f"{sid}\t{m}\n")
-    with open(cp, "w", encoding="utf-8") as f:
+    with open(cp, "w", encoding="utf-8", newline="\n") as f:
         f.write("source1_entity_id\tcandidate_entity_ids\n")
         for sid in tqdm(sorted(candidates), desc="Writing candidate_pairs.tsv", unit="row"):
             c = ",".join(sorted(set(candidates[sid]))) if candidates[sid] else ""
