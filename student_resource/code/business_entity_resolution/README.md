@@ -124,6 +124,21 @@ This will:
 8. Predict on test set (country-by-country for memory efficiency)
 9. Write `output/matching_results.tsv` and `output/candidate_pairs.tsv`
 
+### Resuming after a killed session
+
+Every expensive stage is checkpointed under `student_resource/.checkpoints/`: the training
+sample, candidates, features, each XGBoost grid config, hard negatives, round 2, the final
+model, and — for the test set — each country's candidates and every scored shard of
+100,000 entities. Rerun the same command (or **Run All** in the notebook) and finished
+stages are loaded instead of recomputed. Resumed output is identical to an uninterrupted
+run.
+
+A run's checkpoints are keyed on its arguments and every result-relevant setting in
+`config.py`, so changing a setting starts a fresh run automatically. After a code change
+that alters results, bump `CHECKPOINT_TAG` in `config.py`. Flags: `--no-resume`
+(recompute this run's stages), `--clear-checkpoints` (delete all saved stages). Set
+`ER_CHECKPOINT_DIR` to keep checkpoints elsewhere (must survive restarts).
+
 ### 2. Train Only (for iteration)
 
 ```bash

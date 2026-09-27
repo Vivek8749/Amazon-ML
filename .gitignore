@@ -80,3 +80,6 @@ __MACOSX/
 # Project specific: Output / logs
 **/output/
 *.log
+
+# Resumable pipeline checkpoints (entity_resolution/checkpoint.py)
+**/.checkpoints/

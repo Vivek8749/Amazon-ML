@@ -54,8 +54,12 @@ def cache_save(path: str, df: pd.DataFrame, suffix: str = "") -> None:
     """Save preprocessed DataFrame to parquet cache."""
     os.makedirs(CACHE_DIR, exist_ok=True)
     cp = _cache_path(path, suffix)
+    tmp = f"{cp}.tmp{os.getpid()}"
     try:
-        df.to_parquet(cp, engine="pyarrow", compression="snappy", index=False)
+        # Write-then-rename: a session killed mid-write leaves only a .tmp file,
+        # never a truncated parquet that later runs would fail to read.
+        df.to_parquet(tmp, engine="pyarrow", compression="snappy", index=False)
+        os.replace(tmp, cp)
         sz_mb = os.path.getsize(cp) / (1024 * 1024)
         print(f"  [CACHE SAVE] {os.path.basename(cp)} ({sz_mb:.1f} MB)")
     except Exception as e:
@@ -104,8 +108,10 @@ def embed_cache_save(cache_key: str, embeddings: np.ndarray) -> None:
     """Save embeddings to .npy cache file."""
     os.makedirs(EMBED_CACHE_DIR, exist_ok=True)
     path = os.path.join(EMBED_CACHE_DIR, f"emb_{cache_key}.npy")
+    tmp = f"{path}.tmp{os.getpid()}.npy"
     try:
-        np.save(path, embeddings)
+        np.save(tmp, embeddings)
+        os.replace(tmp, path)          # atomic: never a half-written .npy
         sz_mb = os.path.getsize(path) / (1024 * 1024)
         print(f"  [EMBED CACHE SAVE] {cache_key} ({sz_mb:.1f} MB)")
     except Exception as e:

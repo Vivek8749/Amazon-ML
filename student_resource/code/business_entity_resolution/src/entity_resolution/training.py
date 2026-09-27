@@ -74,11 +74,13 @@ XGB_GRID = [
 ]
 
 
-def train_xgb(X_train, y_train, X_val=None, y_val=None, grid_search=True):
+def train_xgb(X_train, y_train, X_val=None, y_val=None, grid_search=True, checkpoint=None):
     """Train XGBoost with optional grid search over depth/lr/n_estimators.
 
     If grid_search=True and X_val is provided, trains all configs in XGB_GRID,
     picks the one with the best validation F₀.₅. Otherwise uses the first config.
+    With a `checkpoint`, each grid config is saved when trained, so a restarted
+    grid search continues with the next untrained config.
     """
     n_neg = (y_train == 0).sum()
     n_pos = (y_train == 1).sum()
@@ -110,10 +112,9 @@ def train_xgb(X_train, y_train, X_val=None, y_val=None, grid_search=True):
     best_cfg = None
     results = []
 
-    for i, cfg in enumerate(XGB_GRID):
+    def fit_one(cfg):
         params = {**base_params, **cfg}
         model = XGBClassifier(**params, device="cuda")
-        print(f"\n[XGB Grid {i+1}/{len(XGB_GRID)}] {cfg}")
         model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=0)
 
         # Evaluate with F₀.₅ on validation set
@@ -123,12 +124,17 @@ def train_xgb(X_train, y_train, X_val=None, y_val=None, grid_search=True):
             (0.25 * prec + rec) > 0,
             1.25 * prec * rec / (0.25 * prec + rec), 0.0)
         best_idx = np.argmax(fbeta[:-1])
-        f05 = fbeta[best_idx]
-        thresh = thresholds[best_idx]
+        return model, fbeta[best_idx], thresholds[best_idx], prec[best_idx], rec[best_idx]
+
+    for i, cfg in enumerate(XGB_GRID):
+        print(f"\n[XGB Grid {i+1}/{len(XGB_GRID)}] {cfg}")
+        if checkpoint is not None:
+            model, f05, thresh, p, r = checkpoint.stage(f"xgb_grid_{i}", lambda: fit_one(cfg))
+        else:
+            model, f05, thresh, p, r = fit_one(cfg)
 
         results.append((cfg, f05, thresh))
-        print(f"  → F₀.₅={f05:.4f} @ thresh={thresh:.4f} "
-              f"(P={prec[best_idx]:.4f} R={rec[best_idx]:.4f})")
+        print(f"  → F₀.₅={f05:.4f} @ thresh={thresh:.4f} (P={p:.4f} R={r:.4f})")
 
         if f05 > best_f05:
             best_f05 = f05

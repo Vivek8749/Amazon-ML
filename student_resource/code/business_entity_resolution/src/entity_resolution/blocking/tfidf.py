@@ -140,7 +140,7 @@ class TfidfIndex:
                 rows, vals = _block_topk(xp, scores, k)
                 rows, vals = _to_host(xp, rows), _to_host(xp, vals)
                 del scores, dense_q
-                order = np.argsort(-vals, axis=0)
+                order = np.lexsort((rows, -vals), axis=0)   # best first; ties by pool row
                 rows = np.take_along_axis(rows, order, axis=0)
                 vals = np.take_along_axis(vals, order, axis=0)
                 for j in range(c):

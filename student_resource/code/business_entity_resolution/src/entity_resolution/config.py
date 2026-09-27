@@ -18,6 +18,16 @@ MODEL_PATH = os.path.join(SRC_DIR, "models", "xgb_model.pkl")
 CACHE_DIR  = os.path.join(BASE_DIR, ".cache")       # parquet cache for preprocessed data
 EMBED_CACHE_DIR = os.path.join(CACHE_DIR, "embeddings")  # .npy cache for HNSW embeddings
 
+# ===== CHECKPOINTS (resume after a killed session) =============================
+# Each finished stage is saved here and skipped on the next run with the same
+# settings. Must be on storage that survives restarts (on Lightning AI the
+# studio's home directory does). Override with the ER_CHECKPOINT_DIR env var.
+CHECKPOINT_DIR = os.environ.get("ER_CHECKPOINT_DIR", os.path.join(BASE_DIR, ".checkpoints"))
+RESUME         = True               # False: ignore and overwrite saved stages for this run
+CHECKPOINT_TAG = "v1"               # bump after a code change that alters results, so
+                                    # stages saved by older code are not reused
+PRED_SHARD_ENTITIES = 100_000       # test entities scored per checkpointed shard
+
 # ===== GENERAL ================================================================
 TFIDF_TOP_K       = 30              # precision-focused (was 100; caused candidate explosion)
 TFIDF_MAX_FEATURES= 200_000         # 200K vocab — plenty of RAM
