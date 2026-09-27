@@ -147,14 +147,14 @@ def candidates_by_strategy(s1_df, blockers: Blockers):
 
 
 def union_candidates(s1_ids, by_strategy):
-    """Union in strategy order, first occurrence wins (deterministic order)."""
+    """Union of every strategy's candidates, sorted by ID so the order (and the
+    training-row order derived from it) is identical across runs."""
     out = {}
     for sid in s1_ids:
-        seen = {}
+        seen = set()
         for cands in by_strategy.values():
-            for c in cands.get(sid, ()):
-                seen[c] = None
-        out[sid] = list(seen)
+            seen.update(cands.get(sid, ()))
+        out[sid] = sorted(seen)
     return out
 
 

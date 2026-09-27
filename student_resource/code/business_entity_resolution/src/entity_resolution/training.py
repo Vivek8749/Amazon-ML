@@ -16,7 +16,11 @@ from .features import parallel_compute_features_ordered
 # ===== TRAINING DATA ==========================================================
 
 def build_training_data(s1_df, pool_df, gt_df, candidates, neg_ratio=NEG_POS_RATIO):
-    """Build (X, y) from candidate pairs + ground truth, using parallel features."""
+    """Build (X, y) from candidate pairs + ground truth, using parallel features.
+
+    neg_ratio=None keeps every blocked candidate (the distribution the model
+    sees at inference); an int samples at most that many negatives per positive.
+    """
     print("[Train] Assembling pair tuples...")
     t0 = time.time()
 
@@ -41,7 +45,7 @@ def build_training_data(s1_df, pool_df, gt_df, candidates, neg_ratio=NEG_POS_RAT
         pos = [c for c in cands if c in truth  and c in pool_name]
         neg = [c for c in cands if c not in truth and c in pool_name]
 
-        max_neg = max(len(pos) * neg_ratio, 2)
+        max_neg = len(neg) if neg_ratio is None else max(len(pos) * neg_ratio, 2)
         if len(neg) > max_neg:
             neg = rng.choice(neg, size=max_neg, replace=False).tolist()
 
@@ -148,6 +152,37 @@ def train_xgb(X_train, y_train, X_val=None, y_val=None, grid_search=True, checkp
     print(f"[XGB] Best: {best_cfg} → F₀.₅={best_f05:.4f}")
 
     return best_model
+
+
+class EnsembleModel:
+    """Average of several fitted classifiers (same config, different seeds).
+    Exposes the two members the pipeline uses: predict_proba, feature_importances_."""
+
+    def __init__(self, models):
+        self.models = list(models)
+
+    def predict_proba(self, X):
+        return np.mean([m.predict_proba(X) for m in self.models], axis=0)
+
+    @property
+    def feature_importances_(self):
+        return np.mean([m.feature_importances_ for m in self.models], axis=0)
+
+
+def train_ensemble(best_model, X_train, y_train, X_val, y_val, n_models, checkpoint=None):
+    """`best_model` plus n_models-1 refits of its config with other seeds, averaged."""
+    if n_models <= 1:
+        return best_model
+    params = best_model.get_params()
+    members = [best_model]
+    for i in range(1, n_models):
+        def fit(seed=RANDOM_SEED + i):
+            m = XGBClassifier(**{**params, "random_state": seed})
+            m.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=0)
+            return m
+        print(f"[XGB] Ensemble member {i + 1}/{n_models} (seed {RANDOM_SEED + i})")
+        members.append(checkpoint.stage(f"ensemble_{i}", fit) if checkpoint is not None else fit())
+    return EnsembleModel(members)
 
 
 def find_best_threshold(model, X_val, y_val, beta=0.5):

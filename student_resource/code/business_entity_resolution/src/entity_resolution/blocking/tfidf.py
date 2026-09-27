@@ -137,6 +137,9 @@ class TfidfIndex:
                 dense_q = xp.zeros((self.n_features, c), dtype=xp.float32)
                 dense_q[xp.asarray(qc.col), xp.asarray(qc.row)] = xp.asarray(qc.data)
                 scores = pool_mat @ dense_q                          # (n_pool_padded, c)
+                # GPU sums in varying order, so near-equal scores flip between runs;
+                # rounding turns them into exact ties, broken by pool row below.
+                scores = xp.around(scores, 5)
                 rows, vals = _block_topk(xp, scores, k)
                 rows, vals = _to_host(xp, rows), _to_host(xp, vals)
                 del scores, dense_q

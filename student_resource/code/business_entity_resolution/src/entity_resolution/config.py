@@ -24,14 +24,22 @@ EMBED_CACHE_DIR = os.path.join(CACHE_DIR, "embeddings")  # .npy cache for HNSW e
 # studio's home directory does). Override with the ER_CHECKPOINT_DIR env var.
 CHECKPOINT_DIR = os.environ.get("ER_CHECKPOINT_DIR", os.path.join(BASE_DIR, ".checkpoints"))
 RESUME         = True               # False: ignore and overwrite saved stages for this run
-CHECKPOINT_TAG = "v1"               # bump after a code change that alters results, so
+CHECKPOINT_TAG = "v2"               # bump after a code change that alters results, so
                                     # stages saved by older code are not reused
 PRED_SHARD_ENTITIES = 100_000       # test entities scored per checkpointed shard
 
 # ===== GENERAL ================================================================
 TFIDF_TOP_K       = 30              # precision-focused (was 100; caused candidate explosion)
 TFIDF_MAX_FEATURES= 200_000         # 200K vocab — plenty of RAM
-NEG_POS_RATIO     = 5               # more negatives → more conservative model (was 3)
+NEG_POS_RATIO     = None            # None: every blocked candidate is a training pair (the
+                                    # model learns the real candidate mix; +0.0023 held-out
+                                    # F0.5 vs 5 negatives per positive). An int samples negatives
+N_MODELS          = 3               # final model = average of this many seeds of the best grid
+                                    # config (+0.0021 held-out F0.5 vs a single model)
+TRAIN_POOL_EXTRA_PER_COUNTRY = "full"  # training S2+S3 pool: true matches of the sample plus
+                                    # this many random records per country; "full" = every
+                                    # record of the country, as dense as the test pool
+                                    # (None = old default, 20-30K per country)
 RANDOM_SEED       = 42
 VAL_FRACTION      = 0.1
 FEAT_CHUNK        = 25_000          # feature-computation chunk for workers
@@ -87,6 +95,13 @@ PREFILTER_MIN_SCORE      = 0.15     # keep soft threshold — let the cap do the
 HARD_NEG_SCORE_FLOOR = 0.3          # only mine false positives scored above this
 HARD_NEG_MIX_RATIO   = 0.6          # 60% hard negatives, 40% random in round 2
 HARD_NEG_MAX_RATIO   = 5            # never more than 5:1 neg-to-pos after mining
+
+# ---- Final decision (inference.decide_matches) ----
+ONE_TO_ONE        = True            # each S2/S3 record goes to at most one S1 entity (its
+                                    # highest-scoring one): in the training ground truth no
+                                    # record belongs to two S1 entities (7.64M ids, all distinct)
+SCORE_KEEP_FLOOR  = 0.01            # test-time pair scores below this are not stored; must stay
+                                    # below the threshold and SINGLETON_MAX_SCORE_THRESHOLD
 
 # ---- Singleton detection ----
 SINGLETON_MAX_SCORE_THRESHOLD = 0.4 # if best candidate score < this, mark as singleton

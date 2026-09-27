@@ -132,7 +132,7 @@ def load_pool_sampled(s2_path, s3_path, must_have_ids, countries,
             if mask_must.any():
                 frames_must.append(cached[mask_must])
             rest = cached[~mask_must]
-            for co in countries:
+            for co in sorted(countries):
                 if rand_counts[co] >= extra_per_country:
                     continue
                 co_rows = rest[rest["country_norm"] == co]
@@ -159,7 +159,7 @@ def load_pool_sampled(s2_path, s3_path, must_have_ids, countries,
                 frames_must.append(chunk[mask_must])
             # Random sample rows (country-filtered, excluding must-haves)
             rest = chunk[~mask_must]
-            for co in countries:
+            for co in sorted(countries):
                 if rand_counts[co] >= extra_per_country:
                     continue
                 co_rows = rest[rest["country_norm"] == co]
@@ -177,7 +177,7 @@ def load_pool_sampled(s2_path, s3_path, must_have_ids, countries,
         print(f"  [{tag}] scanned + cached")
 
     all_frames = frames_must
-    for co in countries:
+    for co in sorted(countries):
         all_frames.extend(frames_rand[co])
     pool = pd.concat(all_frames, ignore_index=True).drop_duplicates(subset="entity_id")
     print(f"[Pool] {len(pool):,} records in {time.time()-t0:.1f}s")
