@@ -1,6 +1,7 @@
 """Multi-strategy candidate generation: build every blocker once per pool, run
 each one, union their candidates (in a fixed order), then pre-filter."""
 import gc
+import os
 import time
 from dataclasses import dataclass, field
 
@@ -64,8 +65,13 @@ def build_key_indexes(pool_df):
 def build_blockers(pool_df, sbert_model=None) -> Blockers:
     """Build every enabled blocker over `pool_df` (see USE_* in config)."""
     b = Blockers()
-    if USE_CHAR_TFIDF:
+    # ER_CHAR_TFIDF_MAX_POOL (env): skip char TF-IDF for pools larger than this —
+    # its query cost grows with pool size x queries (emergency speed switch).
+    max_pool = int(os.environ.get("ER_CHAR_TFIDF_MAX_POOL", "0") or 0)
+    if USE_CHAR_TFIDF and not (max_pool and len(pool_df) > max_pool):
         b.tfidf["char_tfidf"] = (build_tfidf_blocker(pool_df), TFIDF_TOP_K)
+    elif USE_CHAR_TFIDF:
+        print(f"[Block] char TF-IDF skipped: pool {len(pool_df):,} > ER_CHAR_TFIDF_MAX_POOL={max_pool:,}")
     if USE_WORD_TFIDF:
         b.tfidf["word_tfidf"] = (build_word_tfidf_blocker(pool_df), WORD_TFIDF_TOP_K)
     if NAME_TFIDF_TOP_K > 0:

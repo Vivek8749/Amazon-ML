@@ -7,16 +7,18 @@ query, ~128 h for India). Here each chunk of queries is densified and scored
 with one sparse(pool) x dense(queries) product, followed by an exact two-stage
 block top-K. The same code runs on CuPy (GPU) or NumPy/SciPy (CPU fallback).
 """
+import os
 import time
 
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
+from joblib import Parallel, delayed
 from sklearn.feature_extraction.text import TfidfVectorizer
 from tqdm import tqdm
 
 from ..config import (
-    NAME_TFIDF_MAX_FEATURES, TFIDF_CPU_CHUNK, TFIDF_DEVICE, TFIDF_GPU_MEM_FRACTION,
+    N_WORKERS, NAME_TFIDF_MAX_FEATURES, TFIDF_CPU_CHUNK, TFIDF_FIT_SAMPLE, TFIDF_DEVICE, TFIDF_GPU_MEM_FRACTION,
     TFIDF_MAX_CHUNK, TFIDF_MAX_DF, TFIDF_MAX_FEATURES, WORD_TFIDF_MAX,
 )
 
@@ -78,6 +80,30 @@ def _block_topk(xp, s, k):
     return rows, xp.take_along_axis(vals, loc, axis=0)
 
 
+# ===== PARALLEL VECTORISATION ==================================================
+
+def _parallel_transform(vec, texts):
+    """vec.transform on all CPU cores (sklearn's transform is single-threaded)."""
+    texts = np.asarray(texts, dtype=object)
+    if len(texts) < 200_000:
+        return vec.transform(texts).tocsr()
+    parts = np.array_split(np.arange(len(texts)), N_WORKERS * 2)
+    mats = Parallel(n_jobs=N_WORKERS, backend="loky")(delayed(vec.transform)(texts[p]) for p in parts)
+    return sp.vstack(mats, format="csr")
+
+
+def _fit_transform(vec, texts):
+    """Fit vocabulary + IDF on a sample of at most TFIDF_FIT_SAMPLE records, then
+    transform every record in parallel."""
+    texts = np.asarray(texts, dtype=object)
+    if len(texts) > TFIDF_FIT_SAMPLE:
+        idx = np.random.RandomState(0).choice(len(texts), TFIDF_FIT_SAMPLE, replace=False)
+        vec.fit(texts[np.sort(idx)])
+    else:
+        vec.fit(texts)
+    return _parallel_transform(vec, texts)
+
+
 # ===== INDEX ===================================================================
 
 class TfidfIndex:
@@ -88,7 +114,7 @@ class TfidfIndex:
         xp, xsp, is_gpu = _backend()
         print(f"[Block] Fitting {name} TF-IDF on '{text_col}'...")
         t0 = time.time()
-        mat = vectorizer.fit_transform(pool_df[text_col].values).tocsr()
+        mat = _fit_transform(vectorizer, pool_df[text_col].values)
         mat.indices = mat.indices.astype(np.int32)
         mat.indptr = mat.indptr.astype(np.int32)
         self.n_features = mat.shape[1]
@@ -119,7 +145,9 @@ class TfidfIndex:
 
     def query(self, texts, countries, top_k):
         """Top-k pool entity_ids per query (same country, score > 0, best first)."""
-        xp, _, is_gpu = _backend()
+        xp, xsp, is_gpu = _backend()
+        # ER_TFIDF_SPGEMM=1 (env): sparse x sparse product on the GPU
+        spgemm = is_gpu and os.environ.get("ER_TFIDF_SPGEMM") == "1"
         texts, countries = np.asarray(texts), np.asarray(countries)
         results = [[] for _ in range(len(texts))]
         for co, (pool_mat, pool_ids, n_real) in self.parts.items():
@@ -127,16 +155,25 @@ class TfidfIndex:
             if len(q_idx) == 0:
                 continue
             k = min(top_k, n_real)
-            q_mat = self.vec.transform(texts[q_idx]).tocsr().astype(np.float32)
+            q_mat = _parallel_transform(self.vec, texts[q_idx]).astype(np.float32)
             chunk = self._chunk_size(pool_mat.shape[0])
+            if spgemm:
+                chunk = min(chunk, int(os.environ.get("ER_TFIDF_SPGEMM_CHUNK", "512")))
             starts = range(0, len(q_idx), chunk)
             for start in tqdm(starts, desc=f"{self.name} TF-IDF [{co}]", unit="chunk",
                               leave=False, disable=len(starts) < 2):
-                qc = q_mat[start:start + chunk].tocoo()
-                c = qc.shape[0]
-                dense_q = xp.zeros((self.n_features, c), dtype=xp.float32)
-                dense_q[xp.asarray(qc.col), xp.asarray(qc.row)] = xp.asarray(qc.data)
-                scores = pool_mat @ dense_q                          # (n_pool_padded, c)
+                if spgemm:
+                    # sparse(pool) x sparse(queries^T): work only where n-grams overlap
+                    qT = q_mat[start:start + chunk].T.tocsr()
+                    c = qT.shape[1]
+                    scores = (pool_mat @ xsp.csr_matrix(qT)).toarray()  # (n_pool_padded, c)
+                    dense_q = None
+                else:
+                    qc = q_mat[start:start + chunk].tocoo()
+                    c = qc.shape[0]
+                    dense_q = xp.zeros((self.n_features, c), dtype=xp.float32)
+                    dense_q[xp.asarray(qc.col), xp.asarray(qc.row)] = xp.asarray(qc.data)
+                    scores = pool_mat @ dense_q                          # (n_pool_padded, c)
                 # GPU sums in varying order, so near-equal scores flip between runs;
                 # rounding turns them into exact ties, broken by pool row below.
                 scores = xp.around(scores, 5)

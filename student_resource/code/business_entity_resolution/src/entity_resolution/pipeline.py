@@ -211,10 +211,23 @@ def _model_digest(model):
 def _score_country(ckpt, tag, s1_co, pool_co, model):
     """Candidates, then pair scores shard by shard — each step checkpointed."""
     def _block():
-        blockers = build_blockers(pool_co)
-        c = generate_all_candidates(s1_co, pool_co, blockers)
-        blockers.release()
-        return c
+        # Candidates in blocks of PRED_SHARD_ENTITIES entities, each checkpointed,
+        # so a killed session keeps the finished blocks. Blockers are built once.
+        blockers, merged = None, {}
+        n_blocks = (len(s1_co) + PRED_SHARD_ENTITIES - 1) // PRED_SHARD_ENTITIES
+        for i in range(n_blocks):
+            block = s1_co.iloc[i * PRED_SHARD_ENTITIES:(i + 1) * PRED_SHARD_ENTITIES]
+
+            def _cands(block=block):
+                nonlocal blockers
+                if blockers is None:
+                    blockers = build_blockers(pool_co)
+                return generate_all_candidates(block, pool_co, blockers)
+            print(f"[Test/{tag}] candidate block {i + 1}/{n_blocks}")
+            merged.update(ckpt.stage(f"{tag}/cands_{i:04d}", _cands))
+        if blockers is not None:
+            blockers.release()
+        return merged
     cands = ckpt.stage(f"{tag}/candidates", _block)
 
     parts = []
@@ -267,7 +280,8 @@ def predict_test_by_country(model, threshold, resume=None):
 
     # Preprocess full test S2 + S3 ONCE (cached on disk after first run)
     test_pool_full = None
-    if not all(finished(c) for c in countries):
+    only_env = [c.strip().lower() for c in os.environ.get("ER_COUNTRIES", "").split(",") if c.strip()]
+    if not all(finished(c) for c in countries if not only_env or c in only_env):
         print("[Test] Loading full test pool (preprocessed + cached)...")
         t_pool = time.time()
         pool_parts = []
@@ -280,7 +294,13 @@ def predict_test_by_country(model, threshold, resume=None):
     all_matches = {}
     all_candidates = {}
 
+    # ER_COUNTRIES (env, comma-separated): only compute these countries in this
+    # process; the others are loaded if finished. Output is written once all are.
+    only = [c.strip().lower() for c in os.environ.get("ER_COUNTRIES", "").split(",") if c.strip()]
     for country in countries:
+        if only and country not in only and not finished(country):
+            print(f"\n--- Skipping {country.upper()} (ER_COUNTRIES={','.join(only)}) ---")
+            continue
         print(f"\n--- Processing country: {country.upper()} ---")
         tc = time.time()
         s1_co = ts1[ts1["country_norm"] == country].copy()
@@ -318,6 +338,12 @@ def predict_test_by_country(model, threshold, resume=None):
 
     del test_pool_full; gc.collect()
 
+    missing = len(ts1) - len(all_matches)
+    if missing:
+        print(f"\n[Test] {missing:,} entities belong to countries not finished yet — "
+              f"output not written; rerun without ER_COUNTRIES once they are done")
+        return all_matches, all_candidates
+
     # Write
     write_output(all_matches, all_candidates, OUTPUT_DIR)
     print(f"\n[Test] TOTAL TIME: {time.time()-t0:.0f}s")
@@ -351,6 +377,75 @@ def load_model(path=MODEL_PATH):
     return d["model"], d["threshold"]
 
 
-def run_predict(resume=None):
-    model, threshold = load_model()
-    predict_test_by_country(model, threshold, resume=resume)
+def run_predict(resume=None, threshold=None):
+    model, saved_threshold = load_model()
+    if threshold is not None:
+        print(f"[Model] threshold override: {saved_threshold:.4f} -> {threshold:.4f}")
+    predict_test_by_country(model, saved_threshold if threshold is None else threshold, resume=resume)
+
+
+# Entities at or beyond this position of the seeded shuffle were never in a
+# training sample: run_train samples with RandomState(RANDOM_SEED).choice, which
+# takes a prefix of RandomState(RANDOM_SEED).permutation for any sample size.
+TUNE_OFFSET = 1_000_000
+
+
+def run_tune(n_entities=20_000, resume=None):
+    """Re-tune a saved model's decision threshold without retraining.
+
+    Scores `n_entities` training S1 entities the model never saw against the
+    full training pool (as dense as the test pool), picks the threshold that
+    maximises per-entity macro F0.5 with the one-record-one-entity rule, and
+    saves the model with that threshold (the previous file is kept as a backup).
+    """
+    print("="*72)
+    print(f" TUNE THRESHOLD  ({n_entities:,} unseen training entities, full pool)")
+    print("="*72)
+    t0 = time.time()
+    model, old_threshold = load_model()
+    ckpt = Checkpoint("tune", resume=resume, model=_model_digest(model), n_entities=n_entities)
+
+    def _data():
+        s1_full = load_source(TRAIN_S1)
+        gt_full = pd.read_csv(TRAIN_GT, sep="\t", dtype=str)
+        perm = np.random.RandomState(RANDOM_SEED).permutation(len(s1_full))
+        pick = set(s1_full["entity_id"].values[perm[TUNE_OFFSET:TUNE_OFFSET + n_entities]])
+        s1_t = s1_full[s1_full["entity_id"].isin(pick)].copy()
+        gt_t = gt_full[gt_full["source1_entity_id"].isin(pick)].copy()
+        must = set().union(*parse_ground_truth(gt_t).values())
+        return s1_t, gt_t, must, sorted(s1_t["country_norm"].unique())
+    s1_t, gt_t, must, countries = ckpt.stage("data", _data)
+    truth = parse_ground_truth(gt_t)
+    ids = s1_t["entity_id"].values
+
+    pool = load_pool_sampled(TRAIN_S2, TRAIN_S3, must, countries,
+                             extra_per_country=_pool_extra(n_entities, False))
+
+    def _block():
+        blockers = build_blockers(pool)
+        c = generate_all_candidates(s1_t, pool, blockers)
+        blockers.release()
+        return c
+    cands = ckpt.stage("candidates", _block)
+    scores = ckpt.stage("scores", lambda: score_pairs(model, s1_t, pool, cands))
+    pool = None; gc.collect()          # free the full pool before deciding
+
+    old = decide_matches(scores, old_threshold, ids, one_to_one=False)
+    print(f"\n### Current decision: threshold {old_threshold:.4f}, no one-to-one rule")
+    old_report = loss_breakdown(old, truth, cands)
+    new_threshold, new_f = tune_threshold(scores, truth, ids)
+    print(f"\n### Tuned decision: threshold {new_threshold:.3f}, one-to-one rule")
+    loss_breakdown(decide_matches(scores, new_threshold, ids), truth, cands)
+
+    backup = MODEL_PATH.replace(".pkl", ".before_tune.pkl")
+    if not os.path.exists(backup):
+        os.replace(MODEL_PATH, backup)
+        print(f"[Model] Previous model kept as {backup}")
+    _save_model(model, new_threshold)
+    ckpt.save("final", (old_threshold, old_report["score"], new_threshold, new_f))
+    print(f"\n{'='*72}")
+    print(f"  THRESHOLD {old_threshold:.4f} -> {new_threshold:.3f}:  macro F0.5 "
+          f"{old_report['score']:.4f} -> {new_f:.4f}  on {len(ids):,} unseen entities  "
+          f"({time.time()-t0:.0f}s)")
+    print(f"{'='*72}\n")
+    return new_threshold

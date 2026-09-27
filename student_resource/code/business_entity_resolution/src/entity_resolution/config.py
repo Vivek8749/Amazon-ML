@@ -62,6 +62,8 @@ TFIDF_DEVICE      = "auto"          # "auto" (GPU if CuPy/cuSPARSE work), "cuda"
 TFIDF_GPU_MEM_FRACTION = 0.5        # share of free GPU memory one query chunk may use
 TFIDF_MAX_CHUNK   = 4_096           # max queries scored per chunk
 TFIDF_CPU_CHUNK   = 256             # queries per chunk on the CPU fallback
+TFIDF_FIT_SAMPLE  = 1_000_000       # learn vocabulary/IDF on this many pool records, then
+                                    # transform all records in parallel (fit on 10M took 19 min)
 
 # ---- Which blockers run (all feed the union before the pre-filter) ----
 USE_CHAR_TFIDF    = True
@@ -70,7 +72,8 @@ USE_KEY_INDEXES   = False           # name prefix-5/4, sorted-token, address-num
                                     # <=0.12% unique recall, but +110-145 cands/entity that push
                                     # the union past the pre-filter cap (final recall IN 88.9%
                                     # -> 98.5%, US 98.5% -> 99.8% without them)
-USE_HNSW          = True            # only if sentence-transformers + hnswlib are installed
+USE_HNSW          = os.environ.get("ER_USE_HNSW", "1") == "1"  # env ER_USE_HNSW=0 skips dense retrieval;
+                                    # only runs if sentence-transformers + hnswlib are installed
 USE_LSH           = False           # datasketch MinHash: duplicates char TF-IDF and its
                                     # pure-Python build takes ~40 min per country at test size
 
